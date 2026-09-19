@@ -88,6 +88,12 @@ type ScanProvider interface {
 	Search(ctx context.Context, token string, repository Repository, query string, artifact Artifact) SearchOutcome
 }
 
+// ExplicitRepositoryProvider resolves an explicitly requested repository
+// without relying on the provider's default membership enumeration.
+type ExplicitRepositoryProvider interface {
+	ResolveRepository(ctx context.Context, token, id string) (Repository, error)
+}
+
 type ScanRequest struct {
 	Provider     string
 	Token        string
@@ -126,6 +132,32 @@ func Scan(ctx context.Context, request ScanRequest) (ScanResult, error) {
 	}
 
 	repositories := request.Repositories
+	if repositories == nil && request.Scope.Kind != ScopeDefault {
+		if resolver, ok := request.Scanner.(ExplicitRepositoryProvider); ok {
+			var invalid []RepositoryResult
+			for _, id := range request.Scope.RepositoryIDs {
+				repository, err := resolver.ResolveRepository(ctx, request.Token, id)
+				if err != nil {
+					invalid = append(invalid, RepositoryResult{Repository: Repository{Provider: request.Provider, ID: id}, Status: RepositoryUnscanned})
+					continue
+				}
+				if repository.Provider == "" {
+					repository.Provider = request.Provider
+				}
+				if repository.ID == "" {
+					repository.ID = id
+				}
+				if !repository.Accessible {
+					invalid = append(invalid, RepositoryResult{Repository: repository, Status: RepositoryUnscanned})
+					continue
+				}
+				repositories = append(repositories, repository)
+			}
+			results := invalid
+			selected, _ := selectRepositories(repositories, request.Provider, request.Scope)
+			return scanSelectedRepositories(ctx, request, selected, results)
+		}
+	}
 	if repositories == nil {
 		var err error
 		repositories, err = request.Scanner.Discover(ctx, request.Token)
@@ -156,6 +188,14 @@ func Scan(ctx context.Context, request ScanRequest) (ScanResult, error) {
 		}
 	}
 
+	return scanSelectedRepositories(ctx, request, selected, results)
+}
+
+func scanSelectedRepositories(ctx context.Context, request ScanRequest, selected []Repository, results []RepositoryResult) (ScanResult, error) {
+	if len(selected) == 0 {
+		sort.SliceStable(results, func(i, j int) bool { return results[i].Repository.ID < results[j].Repository.ID })
+		return ScanResult{Repositories: results}, nil
+	}
 	workers := request.Concurrency
 	if workers < 1 {
 		workers = 4

@@ -23,6 +23,49 @@ type runtimeProvider struct {
 	gitlab   *kopis.GitLabClient
 }
 
+func (p runtimeProvider) ResolveRepository(ctx context.Context, token, id string) (kopis.Repository, error) {
+	path := "/repos/" + strings.TrimPrefix(strings.TrimSpace(id), "/")
+	if p.provider == kopis.GitLabProvider {
+		path = "/api/v4/projects/" + url.PathEscape(strings.TrimSpace(id))
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(p.baseURL, "/")+path, nil)
+	if err != nil {
+		return kopis.Repository{}, err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return kopis.Repository{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusForbidden {
+		return kopis.Repository{Provider: p.provider, ID: id, Accessible: false}, nil
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return kopis.Repository{}, errors.New("provider repository lookup failed")
+	}
+	if p.provider == kopis.GitHubProvider {
+		var value struct {
+			FullName string `json:"full_name"`
+			HTMLURL  string `json:"html_url"`
+			Private  bool   `json:"private"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&value); err != nil {
+			return kopis.Repository{}, err
+		}
+		return kopis.Repository{Provider: p.provider, ID: value.FullName, URL: value.HTMLURL, Accessible: true, Public: !value.Private}, nil
+	}
+	var value struct {
+		PathWith string `json:"path_with_namespace"`
+		WebURL   string `json:"web_url"`
+		Public   string `json:"visibility"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&value); err != nil {
+		return kopis.Repository{}, err
+	}
+	return kopis.Repository{Provider: p.provider, ID: value.PathWith, URL: value.WebURL, Accessible: true, Public: value.Public == "public"}, nil
+}
+
 func (p runtimeProvider) Discover(ctx context.Context, token string) ([]kopis.Repository, error) {
 	next := strings.TrimRight(p.baseURL, "/") + p.discoveryPath()
 	var repositories []kopis.Repository
