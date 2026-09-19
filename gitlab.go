@@ -231,15 +231,9 @@ func (c *GitLabClient) search(ctx context.Context, search string, scope GitLabSc
 	}
 
 	var blobs []GitLabBlob
-	more := false
 	truncated := false
+	continuedAtCap := false
 	for page := 1; len(blobs) < gitLabResultCap; page++ {
-		if !c.searchLimit.wait(ctx) {
-			result.Failures = append(result.Failures, GitLabFailure{Kind: "throttled", Retryable: true, Message: "GitLab search budget wait was canceled"})
-			result.Coverage.Status = GitLabPartial
-			result.Coverage.Throttled = true
-			break
-		}
 		pageBlobs, next, failure := c.searchPage(ctx, search, scope, page)
 		result.Coverage.Pages++
 		remaining := gitLabResultCap - len(blobs)
@@ -255,7 +249,7 @@ func (c *GitLabClient) search(ctx context.Context, search string, scope GitLabSc
 			if failure.Status == http.StatusUnauthorized || failure.AccessAmbiguous {
 				result.Coverage.Status = GitLabUnscanned
 			}
-			result.Coverage.Throttled = failure.Status == http.StatusTooManyRequests
+			result.Coverage.Throttled = failure.Status == http.StatusTooManyRequests || failure.Kind == "throttled"
 			result.Coverage.SearchUnavailable = failure.Status == http.StatusNotImplemented || failure.Status == http.StatusServiceUnavailable
 			result.Coverage.AccessAmbiguous = failure.AccessAmbiguous
 			break
@@ -263,9 +257,12 @@ func (c *GitLabClient) search(ctx context.Context, search string, scope GitLabSc
 		if !next {
 			break
 		}
-		more = true
+		if len(blobs) >= gitLabResultCap {
+			continuedAtCap = true
+			break
+		}
 	}
-	if (more || truncated) && len(blobs) >= gitLabResultCap {
+	if (continuedAtCap || truncated) && len(blobs) >= gitLabResultCap {
 		result.Coverage.ResultCapReached = true
 		result.Coverage.Status = GitLabPartial
 	}
@@ -314,7 +311,7 @@ func (c *GitLabClient) searchPage(ctx context.Context, search string, scope GitL
 		failure := GitLabFailure{Kind: "request", Message: "could not create GitLab request"}
 		return nil, false, &failure
 	}
-	response, failure := c.do(request)
+	response, failure := c.do(request, c.searchLimit)
 	if failure != nil {
 		return nil, false, failure
 	}
@@ -387,7 +384,7 @@ func (c *GitLabClient) retrieve(ctx context.Context, blob GitLabBlob) (string, *
 	if err != nil {
 		return "", &GitLabFailure{Kind: "request", Message: "could not create GitLab request"}
 	}
-	response, failure := c.do(request)
+	response, failure := c.do(request, nil)
 	if failure != nil {
 		return "", failure
 	}
@@ -417,8 +414,11 @@ func (c *GitLabClient) newRequest(ctx context.Context, endpoint string, query ur
 	return request, nil
 }
 
-func (c *GitLabClient) do(request *http.Request) (*http.Response, *GitLabFailure) {
+func (c *GitLabClient) do(request *http.Request, searchBudget *searchLimiter) (*http.Response, *GitLabFailure) {
 	for attempt := 0; ; attempt++ {
+		if searchBudget != nil && !searchBudget.wait(request.Context()) {
+			return nil, &GitLabFailure{Kind: "throttled", Retryable: true, Message: "GitLab search budget wait was canceled"}
+		}
 		response, err := c.httpClient.Do(request)
 		if err != nil {
 			if attempt >= c.maxRetries || request.Context().Err() != nil {

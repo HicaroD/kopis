@@ -44,6 +44,7 @@ var (
 	secretFile   = regexp.MustCompile(`(?i)(?:(?:cat|read|open|readFile|fs\.readFileSync)\s+[^\n]*(?:\.env|credentials|secret|token|\.pem)|(?:open|readFile|fs\.readFileSync)\s*\(\s*["'][^"']*(?:\.env|credentials|secret|token|\.pem)[^"']*["']\s*\))`)
 	processArg   = regexp.MustCompile(`(?i)(?:curl|wget|httpie|gh|git|npm|docker)\b[^\n]*(?:--(?:token|password|header|auth)|(?:token|password|authorization)=)`)
 	transfer     = regexp.MustCompile(`(?i)(?:curl|wget|scp|rsync|nc|netcat)\b[^\n]*(?:https?://|--data|--upload-file|-T\s)`)
+	directAuth   = regexp.MustCompile(`(?i)(?:api[_-]?key|token|secret|password|authorization|auth|client[_-]?secret)\s*[=:]\s*["']?$`)
 )
 
 // Inspect examines only an already catalogued candidate.
@@ -53,11 +54,7 @@ func Inspect(candidate Candidate) []Finding {
 	for _, match := range assignment.FindAllStringSubmatchIndex(content, -1) {
 		valueStart, valueEnd := assignmentValue(match)
 		value := content[valueStart:valueEnd]
-		if match[8] >= 0 {
-			defaultStart := strings.Index(value, ":-") + 2
-			valueStart += defaultStart
-			value = value[defaultStart:]
-		}
+		value, valueStart = literalAssignmentValue(value, valueStart)
 		if excluded(value) || !literal(value) {
 			continue
 		}
@@ -78,7 +75,7 @@ func Inspect(candidate Candidate) []Finding {
 			}
 			indicator, severity := "private_key", SeverityCritical
 			if expression != privateKey {
-				indicator, severity = "authorization_value", SeverityCritical
+				indicator, severity = "authorization_value", expressionSeverity(content, match[0], expression)
 			}
 			findings = append(findings, finding(candidate, indicator, ClassificationConfirmed, severity, value, match[0], "Confirmed literal credential exposure. Rotate or revoke it, remove it from repository history where policy permits, and use runtime secret injection."))
 		}
@@ -94,6 +91,21 @@ func Inspect(candidate Candidate) []Finding {
 		}
 	}
 	return uniqueFindings(findings)
+}
+
+func expressionSeverity(content string, start int, expression *regexp.Regexp) string {
+	if expression == secretURL {
+		return SeverityHigh
+	}
+	prefixStart := start - 80
+	if prefixStart < 0 {
+		prefixStart = 0
+	}
+	prefix := content[prefixStart:start]
+	if directAuth.MatchString(prefix) {
+		return SeverityCritical
+	}
+	return SeverityHigh
 }
 
 // InspectCandidate is the named entry point for the inspection boundary.
@@ -153,6 +165,18 @@ func assignmentValue(match []int) (int, int) {
 		}
 	}
 	return 0, 0
+}
+
+func literalAssignmentValue(value string, start int) (string, int) {
+	if !strings.HasPrefix(value, "${") || !strings.HasSuffix(value, "}") {
+		return value, start
+	}
+	separator := strings.Index(value, ":-")
+	if separator < 0 {
+		return value, start
+	}
+	separator += 2
+	return value[separator : len(value)-1], start + separator
 }
 
 func directAuthenticationKey(key string) bool {

@@ -144,3 +144,26 @@ func TestGitHubSearchDoesNotRetryDeniedScope(t *testing.T) {
 		t.Fatalf("expected privacy-preserving unscanned result, requests=%d result=%+v", requests.Load(), result)
 	}
 }
+
+func TestGitHubSearchBudgetCoversRetries(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		response.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	now := time.Unix(100, 0)
+	client, err := NewGitHubClient(GitHubConfig{
+		BaseURL: server.URL, Token: "token", MaxRetries: 10,
+		RetryWait: time.Nanosecond, MaxRetryWait: time.Nanosecond,
+		Now:   func() time.Time { return now },
+		Sleep: func(context.Context, time.Duration) bool { return false },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := client.Search(context.Background(), "path:config")
+	if requests.Load() != 10 || result.Coverage.Status != GitHubPartial || !result.Coverage.Throttled {
+		t.Fatalf("retry attempts bypassed search budget: requests=%d coverage=%+v", requests.Load(), result.Coverage)
+	}
+}

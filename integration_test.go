@@ -126,3 +126,26 @@ func TestInspectionCredentialFormsLocationsSeverityAndExecution(t *testing.T) {
 		t.Fatalf("unexpected severity mapping: %+v", findings)
 	}
 }
+
+func TestInspectionQuotedDefaultUsesLiteralLocationAndFingerprint(t *testing.T) {
+	content := `api_key="${TOKEN:-literal-secret}" api_key=${TOKEN:-literal-secret}`
+	findings := Inspect(Candidate{Path: "opencode.json", CatalogRule: "opencode.config", Content: content})
+	if len(findings) != 2 {
+		t.Fatalf("expected both quoted and unquoted defaults: %+v", findings)
+	}
+	for _, finding := range findings {
+		if finding.Severity != SeverityCritical || finding.Fingerprint != fingerprint("literal-secret") {
+			t.Fatalf("default was not treated as the confirmed literal: %+v", finding)
+		}
+		if got := content[finding.Location.StartByte:finding.Location.EndByte]; got != "literal-secret" {
+			t.Fatalf("default location included expression syntax: %q", got)
+		}
+	}
+}
+
+func TestInspectionCredentialURLIsHighUnlessDirectField(t *testing.T) {
+	findings := Inspect(Candidate{Path: "settings.json", CatalogRule: "claude.settings", Content: `url="https://user:password@safe.test/path"`})
+	if len(findings) != 1 || findings[0].Indicator != "authorization_value" || findings[0].Severity != SeverityHigh {
+		t.Fatalf("credential-bearing URL was over-promoted: %+v", findings)
+	}
+}

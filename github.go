@@ -191,12 +191,6 @@ func (c *GitHubClient) Search(ctx context.Context, query string) GitHubSearchRes
 			break
 		}
 		seenPages[next] = true
-		if !c.searchLimit.wait(ctx) {
-			result.Failures = append(result.Failures, GitHubFailure{Kind: "throttled", Retryable: true, Message: "GitHub code-search budget wait was canceled"})
-			result.Coverage.Status = GitHubPartial
-			result.Coverage.Throttled = true
-			break
-		}
 		response, pageItems, pageNext, failure := c.searchPage(ctx, next)
 		result.Coverage.Pages++
 		if failure != nil {
@@ -332,7 +326,7 @@ func (c *GitHubClient) searchPage(ctx context.Context, rawURL string) (githubSea
 	if err != nil {
 		return githubSearchResponse{}, nil, "", &GitHubFailure{Kind: "request", Message: "could not create GitHub request"}
 	}
-	response, failure := c.do(request)
+	response, failure := c.do(request, c.searchLimit)
 	if failure != nil {
 		return githubSearchResponse{}, nil, "", failure
 	}
@@ -402,7 +396,7 @@ func (c *GitHubClient) retrieve(ctx context.Context, item githubSearchItem) (str
 	if err != nil {
 		return "", &GitHubFailure{Kind: "request", Message: "could not create GitHub retrieval request"}
 	}
-	response, failure := c.do(request)
+	response, failure := c.do(request, nil)
 	if failure != nil {
 		return "", failure
 	}
@@ -441,8 +435,11 @@ func (c *GitHubClient) endpoint(path string, query url.Values) string {
 	return requestURL.String()
 }
 
-func (c *GitHubClient) do(request *http.Request) (*http.Response, *GitHubFailure) {
+func (c *GitHubClient) do(request *http.Request, searchBudget *searchLimiter) (*http.Response, *GitHubFailure) {
 	for attempt := 0; ; attempt++ {
+		if searchBudget != nil && !searchBudget.wait(request.Context()) {
+			return nil, &GitHubFailure{Kind: "throttled", Retryable: true, Message: "GitHub code-search budget wait was canceled"}
+		}
 		response, err := c.httpClient.Do(request)
 		if err != nil {
 			if attempt >= c.maxRetries || request.Context().Err() != nil {

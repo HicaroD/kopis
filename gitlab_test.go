@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -128,5 +129,51 @@ func TestGitLabSearchLimiterCancelsAfterOneHundredRequests(t *testing.T) {
 	}
 	if limiter.wait(context.Background()) {
 		t.Fatal("request 101 bypassed the shared budget")
+	}
+}
+
+func TestGitLabSearchBudgetCoversRetries(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		requests++
+		response.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	now := time.Unix(100, 0)
+	client, err := NewGitLabClient(GitLabConfig{
+		BaseURL: server.URL, Token: "token", MaxRetries: 100,
+		RetryWait: time.Nanosecond, MaxRetryWait: time.Nanosecond,
+		Now:   func() time.Time { return now },
+		Sleep: func(context.Context, time.Duration) bool { return false },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := client.SearchProject(context.Background(), "path", "group/project")
+	if requests != 100 || result.Coverage.Status != GitLabPartial || !result.Coverage.Throttled {
+		t.Fatalf("retry attempts bypassed search budget: requests=%d coverage=%+v", requests, result.Coverage)
+	}
+}
+
+func TestGitLabExactlyTenThousandTerminalResultsAreComplete(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		page, _ := strconv.Atoi(request.URL.Query().Get("page"))
+		if page < 100 {
+			response.Header().Set("X-Next-Page", strconv.Itoa(page+1))
+		}
+		blobs := make([]GitLabBlob, gitLabPageSize)
+		for i := range blobs {
+			blobs[i] = GitLabBlob{ProjectID: "42", ProjectPath: "group/project", Path: "artifact", Ref: "rev", Size: 10}
+		}
+		_ = json.NewEncoder(response).Encode(blobs)
+	}))
+	defer server.Close()
+	client, err := NewGitLabClient(GitLabConfig{BaseURL: server.URL, Token: "token", Now: func() time.Time { return time.Unix(100, 0) }, Sleep: func(context.Context, time.Duration) bool { return false }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := client.SearchProject(context.Background(), "path", "group/project")
+	if result.Coverage.Results != 10000 || result.Coverage.ResultCapReached || result.Coverage.Status != GitLabComplete {
+		t.Fatalf("terminal ten-thousand boundary was marked partial: %+v", result.Coverage)
 	}
 }
