@@ -23,6 +23,8 @@ type runtimeProvider struct {
 	gitlab   *kopis.GitLabClient
 }
 
+var newGitHubRuntimeClient = kopis.NewGitHubClient
+
 func (p runtimeProvider) ResolveRepository(ctx context.Context, token, id string) (kopis.Repository, error) {
 	path := "/repos/" + strings.TrimPrefix(strings.TrimSpace(id), "/")
 	if p.provider == kopis.GitLabProvider {
@@ -203,7 +205,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	provider := runtimeProvider{provider: *providerName, token: token, baseURL: apiURL}
 	var err error
 	if *providerName == kopis.GitHubProvider {
-		provider.github, err = kopis.NewGitHubClient(kopis.GitHubConfig{BaseURL: apiURL, Token: token})
+		provider.github, err = newGitHubRuntimeClient(kopis.GitHubConfig{BaseURL: apiURL, Token: token})
 	} else {
 		provider.gitlab, err = kopis.NewGitLabClient(kopis.GitLabConfig{BaseURL: apiURL, Token: token})
 	}
