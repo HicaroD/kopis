@@ -32,6 +32,35 @@ type Artifact struct {
 	Rule CatalogRule
 }
 
+// InitialCatalog returns the concrete catalog entries used by the CLI's
+// provider searches. Dynamic directory rules remain enforced by recognition.
+func InitialCatalog() []Artifact {
+	entries := []struct{ path, id, tool, pattern, indicator string }{
+		{"opencode.json", "opencode.config", ToolOpenCode, "project-root opencode configuration", "credential_fields"},
+		{"opencode.jsonc", "opencode.config", ToolOpenCode, "project-root opencode configuration", "credential_fields"},
+		{".opencode/plugins/index.ts", "opencode.plugin", ToolOpenCode, "OpenCode plugin", "executable"},
+		{".opencode/tools/tool.ts", "opencode.tool", ToolOpenCode, "OpenCode custom tool", "executable"},
+		{".github/workflows/opencode.yml", "opencode.workflow", ToolOpenCode, "workflow using anomalyco/opencode/github", "workflow_provider_key"},
+		{".mcp.json", "claude.mcp", ToolClaudeCode, "project-root Claude MCP configuration", "credential_fields"},
+		{".claude/settings.json", "claude.settings", ToolClaudeCode, "Claude project settings", "credential_fields"},
+		{".codex/config.toml", "codex.config", ToolCodex, "Codex configuration", "credential_fields"},
+		{".github/workflows/codex.yml", "codex.workflow", ToolCodex, "workflow using openai/codex-action", "workflow_provider_key"},
+		{".agents/mcp_config.json", "antigravity.mcp", ToolAntigravity, "Antigravity MCP configuration", "credential_fields"},
+		{".agents/hooks.json", "antigravity.hooks", ToolAntigravity, "Antigravity hooks", "executable"},
+		{".agents/skills/index.md", "antigravity.skills", ToolAntigravity, "Antigravity skills", "executable"},
+		{".agents/rules/index.md", "antigravity.rules", ToolAntigravity, "Antigravity rules", "executable"},
+		{".gemini/settings.json", "gemini.settings", ToolGeminiCLI, "Gemini CLI settings", "credential_fields"},
+		{".gemini/commands/default.toml", "gemini.commands", ToolGeminiCLI, "Gemini CLI commands", "executable"},
+		{"gemini-extension.json", "gemini.extension", ToolGeminiCLI, "Gemini extension manifest", "credential_fields"},
+		{".gemini/skills/index.md", "gemini.skills", ToolGeminiCLI, "Gemini CLI skills", "executable"},
+	}
+	result := make([]Artifact, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, Artifact{Path: entry.path, Rule: CatalogRule{ID: entry.id, Tool: entry.tool, Pattern: entry.pattern, Indicators: []string{entry.indicator}, Applicability: "initial evidence-backed catalog", Confidence: "catalogued artifact only"}})
+	}
+	return result
+}
+
 // CataloguedFiles returns every file admitted by the initial evidence-backed
 // catalog. Contents are used only for pairing rules and file substitutions.
 func CataloguedFiles(files map[string]string) []Artifact {
@@ -102,15 +131,6 @@ func catalogMatches(filename, content string, files map[string]string) []Artifac
 	if strings.HasPrefix(p, ".agents/skills/") {
 		rules = append(rules, rule("gemini.skills", ToolGeminiCLI, "Gemini CLI skills", "executable"))
 	}
-	// OpenCode project substitutions admit only the explicitly referenced file.
-	if p == "opencode.json" || p == "opencode.jsonc" {
-		for _, referenced := range fileSubstitutions(content) {
-			if value, ok := files[referenced]; ok {
-				_ = value
-				rules = append(rules, rule("opencode.file-substitution", ToolOpenCode, "repository-relative {file:...} target", "credential_fields"))
-			}
-		}
-	}
 	result := make([]Artifact, 0, len(rules))
 	for _, r := range rules {
 		result = append(result, Artifact{Path: filename, Rule: r})
@@ -132,7 +152,7 @@ func claudePluginRootExists(p string, files map[string]string) bool {
 			return true
 		}
 	}
-	return strings.Contains("/"+slashPath(p), "/plugins/")
+	return false
 }
 
 func rule(id, tool, pattern, indicator string) CatalogRule {

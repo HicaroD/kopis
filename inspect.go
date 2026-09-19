@@ -37,11 +37,11 @@ type Finding struct {
 }
 
 var (
-	assignment   = regexp.MustCompile(`(?im)([A-Za-z][A-Za-z0-9_.-]*(?:api[_-]?key|token|secret|password|authorization|auth|client[_-]?secret|openai-api-key)[A-Za-z0-9_.-]*)\s*[=:]\s*["']?([^\s"',}\]]+)["']?`)
+	assignment   = regexp.MustCompile(`(?im)\b((?:[A-Za-z][A-Za-z0-9_.-]*?)?(?:api[_-]?key|token|secret|password|authorization|auth|client[_-]?secret|openai-api-key)[A-Za-z0-9_.-]*)\s*[=:]\s*(?:"([^"]+)"|'([^']+)'|(\$\{[A-Za-z_][A-Za-z0-9_]*:-[^}]+\})|([^\s"',}\]]+))`)
 	quotedSecret = regexp.MustCompile(`(?i)(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}`)
 	privateKey   = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
 	secretURL    = regexp.MustCompile(`(?i)https?://[^\s"']+:[^\s@"']+@[^\s"']+`)
-	secretFile   = regexp.MustCompile(`(?i)(?:cat|read|open|readFile|fs\.readFileSync)\s+[^\n]*(?:\.env|credentials|secret|token|\.pem)`)
+	secretFile   = regexp.MustCompile(`(?i)(?:(?:cat|read|open|readFile|fs\.readFileSync)\s+[^\n]*(?:\.env|credentials|secret|token|\.pem)|(?:open|readFile|fs\.readFileSync)\s*\(\s*["'][^"']*(?:\.env|credentials|secret|token|\.pem)[^"']*["']\s*\))`)
 	processArg   = regexp.MustCompile(`(?i)(?:curl|wget|httpie|gh|git|npm|docker)\b[^\n]*(?:--(?:token|password|header|auth)|(?:token|password|authorization)=)`)
 	transfer     = regexp.MustCompile(`(?i)(?:curl|wget|scp|rsync|nc|netcat)\b[^\n]*(?:https?://|--data|--upload-file|-T\s)`)
 )
@@ -51,7 +51,13 @@ func Inspect(candidate Candidate) []Finding {
 	var findings []Finding
 	content := candidate.Content
 	for _, match := range assignment.FindAllStringSubmatchIndex(content, -1) {
-		value := content[match[4]:match[5]]
+		valueStart, valueEnd := assignmentValue(match)
+		value := content[valueStart:valueEnd]
+		if match[8] >= 0 {
+			defaultStart := strings.Index(value, ":-") + 2
+			valueStart += defaultStart
+			value = value[defaultStart:]
+		}
 		if excluded(value) || !literal(value) {
 			continue
 		}
@@ -59,10 +65,10 @@ func Inspect(candidate Candidate) []Finding {
 		indicator := indicatorForKey(key)
 		classification := ClassificationConfirmed
 		severity := SeverityHigh
-		if strings.Contains(key, "private") {
+		if directAuthenticationKey(key) || strings.Contains(key, "private") {
 			severity = SeverityCritical
 		}
-		findings = append(findings, finding(candidate, indicator, classification, severity, value, match[0], "Confirmed literal credential exposure. Rotate or revoke it, remove it from repository history where policy permits, and use runtime secret injection."))
+		findings = append(findings, finding(candidate, indicator, classification, severity, value, valueStart, "Confirmed literal credential exposure. Rotate or revoke it, remove it from repository history where policy permits, and use runtime secret injection."))
 	}
 	for _, expression := range []*regexp.Regexp{privateKey, quotedSecret, secretURL} {
 		for _, match := range expression.FindAllStringIndex(content, -1) {
@@ -72,7 +78,7 @@ func Inspect(candidate Candidate) []Finding {
 			}
 			indicator, severity := "private_key", SeverityCritical
 			if expression != privateKey {
-				indicator, severity = "authorization_value", SeverityHigh
+				indicator, severity = "authorization_value", SeverityCritical
 			}
 			findings = append(findings, finding(candidate, indicator, ClassificationConfirmed, severity, value, match[0], "Confirmed literal credential exposure. Rotate or revoke it, remove it from repository history where policy permits, and use runtime secret injection."))
 		}
@@ -137,7 +143,20 @@ func fingerprint(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 func literal(value string) bool {
-	return len(value) >= 8 && !strings.HasPrefix(value, "$") && !strings.HasPrefix(value, "%") && !strings.Contains(value, "{{")
+	return len(value) >= 8 && !strings.HasPrefix(value, "$") && !strings.HasPrefix(value, "%") && !strings.Contains(value, "{{") && !strings.Contains(value, "${{")
+}
+
+func assignmentValue(match []int) (int, int) {
+	for _, pair := range [][2]int{{4, 5}, {6, 7}, {8, 9}, {10, 11}} {
+		if match[pair[0]] >= 0 {
+			return match[pair[0]], match[pair[1]]
+		}
+	}
+	return 0, 0
+}
+
+func directAuthenticationKey(key string) bool {
+	return strings.Contains(key, "api") || strings.Contains(key, "authorization") || strings.Contains(key, "auth") || strings.Contains(key, "token") || strings.Contains(key, "clientsecret") || strings.Contains(key, "client_secret")
 }
 func excluded(value string) bool {
 	lower := strings.ToLower(value)
@@ -151,7 +170,10 @@ func reasonFor(classification string) string {
 }
 func safeURL(raw string) string {
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.User == nil {
+	if err != nil {
+		return ""
+	}
+	if parsed.User == nil {
 		return raw
 	}
 	parsed.User = nil

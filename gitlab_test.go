@@ -117,3 +117,16 @@ func TestGitLabCapabilitiesDisableGlobalSearch(t *testing.T) {
 		t.Fatal("client stored a header instead of the raw token")
 	}
 }
+
+func TestGitLabSearchLimiterCancelsAfterOneHundredRequests(t *testing.T) {
+	now := time.Unix(100, 0)
+	limiter := &searchLimiter{now: func() time.Time { return now }, limit: 100, sleep: func(context.Context, time.Duration) bool { return false }}
+	for i := 0; i < 100; i++ {
+		if !limiter.wait(context.Background()) {
+			t.Fatal("initial budget request was delayed")
+		}
+	}
+	if limiter.wait(context.Background()) {
+		t.Fatal("request 101 bypassed the shared budget")
+	}
+}

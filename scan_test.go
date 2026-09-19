@@ -2,19 +2,25 @@ package kopis
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 )
 
 type scanProvider struct {
-	mu        sync.Mutex
-	seenToken []string
-	searches  []string
-	outcomes  map[string]SearchOutcome
+	mu           sync.Mutex
+	seenToken    []string
+	searches     []string
+	outcomes     map[string]SearchOutcome
+	repositories []Repository
+	discoverErr  error
 }
 
 func (p *scanProvider) Discover(context.Context, string) ([]Repository, error) {
+	if p.repositories != nil || p.discoverErr != nil {
+		return p.repositories, p.discoverErr
+	}
 	return []Repository{
 		{Provider: GitHubProvider, ID: "owner/complete", Owner: true, Accessible: true},
 		{Provider: GitHubProvider, ID: "member/partial", Member: true, Accessible: true},
@@ -70,6 +76,33 @@ func TestScanFiltersDeduplicatesAndComposesRepositoryStatuses(t *testing.T) {
 	for _, search := range provider.searches {
 		if !strings.HasSuffix(search, "path:opencode.json") {
 			t.Fatalf("search was not catalog-derived: %s", search)
+		}
+	}
+}
+
+func TestScanExcludesDeniedDefaultRepositories(t *testing.T) {
+	provider := &scanProvider{outcomes: map[string]SearchOutcome{"allowed/default": {Complete: true}}, repositories: []Repository{
+		{Provider: GitHubProvider, ID: "denied/default", Owner: true, Accessible: false},
+		{Provider: GitHubProvider, ID: "allowed/default", Member: true, Accessible: true},
+	}}
+	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "runtime-token", Scanner: provider, Catalog: []Artifact{{Path: "opencode.json"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Repositories) != 2 || result.Repositories[0].Repository.ID != "allowed/default" || result.Repositories[0].Status != RepositoryNoCandidateArtifacts || result.Repositories[1].Repository.ID != "denied/default" || result.Repositories[1].Status != RepositoryUnscanned {
+		t.Fatalf("denied default repository was searched or status lost: %+v", result.Repositories)
+	}
+}
+
+func TestScanDiscoveryFailurePreservesExplicitRepositoriesAsUnscanned(t *testing.T) {
+	provider := &scanProvider{discoverErr: errors.New("provider unavailable")}
+	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "runtime-token", Scanner: provider, Scope: Scope{Kind: ScopeList, RepositoryIDs: []string{"one/repo", "two/repo"}}})
+	if err != nil || len(result.Repositories) != 2 {
+		t.Fatalf("discovery failure lost explicit scope: result=%+v err=%v", result, err)
+	}
+	for _, repository := range result.Repositories {
+		if repository.Status != RepositoryUnscanned {
+			t.Fatalf("unexpected discovery failure status: %+v", result.Repositories)
 		}
 	}
 }

@@ -54,13 +54,16 @@ func Present(result ScanResult) Presentation {
 // intentionally absent; guidance remains available on finding lines.
 func WriteTerminal(w io.Writer, result ScanResult) error {
 	presentation := Present(result)
+	if _, err := fmt.Fprintf(w, "complete=%t exit_code=%d\n", presentation.Complete, presentation.ExitCode); err != nil {
+		return err
+	}
 	for _, repository := range presentation.Repositories {
-		if _, err := fmt.Fprintf(w, "%s %s %s\n", repository.Provider, repository.Repository, repository.Status); err != nil {
+		if _, err := fmt.Fprintf(w, "%s %s url=%s status=%s findings=%d\n", repository.Provider, repository.Repository, repository.URL, repository.Status, repository.Findings); err != nil {
 			return err
 		}
 	}
 	for _, finding := range presentation.Findings {
-		if _, err := fmt.Fprintf(w, "finding %s %s %s:%d %s %s\n", finding.Provider, finding.Repository, finding.Path, finding.Location.StartLine, finding.Classification, finding.Severity); err != nil {
+		if _, err := fmt.Fprintf(w, "finding provider=%s repository=%s url=%s revision=%s path=%s tool=%s rule=%s location=%d-%d/%d-%d indicator=%s classification=%s severity=%s (%s %s) fingerprint=%s reason=%s\n", finding.Provider, finding.Repository, finding.RepositoryURL, finding.Revision, finding.Path, finding.Tool, finding.CatalogRule, finding.Location.StartLine, finding.Location.StartByte, finding.Location.EndLine, finding.Location.EndByte, finding.Indicator, finding.Classification, finding.Severity, finding.Classification, finding.Severity, finding.Fingerprint, finding.Reason); err != nil {
 			return err
 		}
 		if _, err := fmt.Fprintf(w, "guidance: %s\n", finding.Guidance); err != nil {
@@ -87,7 +90,10 @@ func ExitCode(result ScanResult) int { return Present(result).ExitCode }
 
 func redactURL(raw string) string {
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.User == nil {
+	if err != nil {
+		return ""
+	}
+	if parsed.User == nil {
 		return raw
 	}
 	parsed.User = nil

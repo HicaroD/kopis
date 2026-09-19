@@ -57,3 +57,21 @@ func TestIncompleteRepositoryProducesNonZeroOutcomeInBothFormats(t *testing.T) {
 		t.Fatalf("incomplete result was presented as complete: %+v", decoded)
 	}
 }
+
+func TestPresentationFailsClosedForMalformedCredentialURL(t *testing.T) {
+	result := presentationResult(RepositoryNoFindings)
+	result.Repositories[0].Repository.URL = "https://user:%zz@example.test/repository"
+	result.Findings[0].RepositoryURL = result.Repositories[0].Repository.URL
+	var terminal, jsonl bytes.Buffer
+	if err := WriteTerminal(&terminal, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteJSONL(&jsonl, result); err != nil {
+		t.Fatal(err)
+	}
+	for _, output := range []string{terminal.String(), jsonl.String()} {
+		if strings.Contains(output, "user:") || strings.Contains(output, "%zz") {
+			t.Fatalf("malformed credential URL leaked: %q", output)
+		}
+	}
+}

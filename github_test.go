@@ -30,6 +30,23 @@ func TestGitHubQueryValidationRejectsBeforeNetwork(t *testing.T) {
 	if requests.Load() != 0 || result.Failures[0].Kind != "malformed_query" {
 		t.Fatalf("expected boolean-operator rejection, requests=%d result=%+v", requests.Load(), result)
 	}
+	result = client.Search(context.Background(), strings.Repeat("x", githubQueryLimit-1)+" unknown:qualifier")
+	if requests.Load() != 0 || result.Coverage.Status != GitHubUnscanned {
+		t.Fatalf("unknown colon token bypassed query limit: requests=%d result=%+v", requests.Load(), result)
+	}
+}
+
+func TestGitHubSearchLimiterCancelsAfterTenRequests(t *testing.T) {
+	now := time.Unix(100, 0)
+	limiter := &searchLimiter{now: func() time.Time { return now }, limit: 10, sleep: func(context.Context, time.Duration) bool { return false }}
+	for i := 0; i < 10; i++ {
+		if !limiter.wait(context.Background()) {
+			t.Fatal("initial budget request was delayed")
+		}
+	}
+	if limiter.wait(context.Background()) {
+		t.Fatal("request 11 bypassed the shared budget")
+	}
 }
 
 func TestGitHubSearchPaginatesEncodesAndRetrievesPinnedBlobs(t *testing.T) {

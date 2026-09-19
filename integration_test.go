@@ -75,3 +75,54 @@ func TestDeterministicProviderJourneysReachRedactedOutputs(t *testing.T) {
 		})
 	}
 }
+
+func TestCatalogSubstitutionAndClaudeMarkerBoundaries(t *testing.T) {
+	files := map[string]string{
+		"opencode.json":               `{"instructions":["{file:secrets.txt}"]}`,
+		"secrets.txt":                 "api_key=literal-secret",
+		"plugins/unrelated/.mcp.json": "token=literal-secret",
+	}
+	opencode := RecognizeArtifact("opencode.json", files)
+	if len(opencode) != 2 || opencode[0].Rule.ID != "opencode.config" || opencode[1].Rule.ID != "opencode.file-substitution" {
+		t.Fatalf("config inherited target substitution rule: %+v", opencode)
+	}
+	if got := RecognizeArtifact("plugins/unrelated/.mcp.json", files); len(got) != 0 {
+		t.Fatalf("unmarked Claude plugin was admitted: %+v", got)
+	}
+	files["plugins/unrelated/.claude-plugin/plugin.json"] = "{}"
+	if got := RecognizeArtifact("plugins/unrelated/.mcp.json", files); len(got) != 1 || got[0].Rule.ID != "claude.plugin-mcp" {
+		t.Fatalf("marker-backed Claude plugin was not admitted: %+v", got)
+	}
+}
+
+func TestInspectionCredentialFormsLocationsSeverityAndExecution(t *testing.T) {
+	content := "api_key=literal-api-value\npassword: literal-password\nclientSecret=literal-client-secret\n" +
+		"authorization=Bearer literal-auth-value\n" +
+		"api_key_default=${TOKEN:-literal-default}\nref=${TOKEN}\nplain=$TOKEN\npercent=%TOKEN%\n" +
+		"fs.readFileSync(\".env\")\nreadFile(\"credentials\")\nopen(\"key.pem\")"
+	findings := Inspect(Candidate{Path: "plugin.ts", CatalogRule: "opencode.plugin", Content: content})
+	if len(findings) != 8 {
+		t.Fatalf("unexpected findings: %+v", findings)
+	}
+	for _, finding := range findings {
+		if finding.Location.StartByte < 0 || finding.Location.EndByte <= finding.Location.StartByte || finding.Location.StartLine < 1 {
+			t.Fatalf("invalid value location: %+v", finding)
+		}
+		if finding.Classification == ClassificationConfirmed && finding.Fingerprint == "" {
+			t.Fatalf("confirmed finding lacks fingerprint: %+v", finding)
+		}
+	}
+	critical := 0
+	medium := 0
+	for _, finding := range findings {
+		if finding.Severity == SeverityCritical {
+			critical++
+		}
+		if finding.Severity == SeverityMedium {
+			medium++
+		}
+	}
+	if critical != 4 || medium != 3 {
+		t.Fatalf("unexpected severity mapping: %+v", findings)
+	}
+}

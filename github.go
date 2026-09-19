@@ -36,6 +36,8 @@ type GitHubConfig struct {
 	MaxRetries   int
 	RetryWait    time.Duration
 	MaxRetryWait time.Duration
+	Now          func() time.Time
+	Sleep        func(context.Context, time.Duration) bool
 }
 
 type GitHubFailure struct {
@@ -75,6 +77,15 @@ type GitHubClient struct {
 	maxRetries   int
 	retryWait    time.Duration
 	maxRetryWait time.Duration
+	searchLimit  *searchLimiter
+}
+
+type searchLimiter struct {
+	mu     sync.Mutex
+	starts []time.Time
+	now    func() time.Time
+	sleep  func(context.Context, time.Duration) bool
+	limit  int
 }
 
 type githubSearchResponse struct {
@@ -129,7 +140,25 @@ func NewGitHubClient(config GitHubConfig) (*GitHubClient, error) {
 	if maxRetryWait <= 0 {
 		maxRetryWait = time.Second
 	}
-	return &GitHubClient{baseURL: base, token: config.Token, httpClient: client, concurrency: concurrency, maxRetries: maxRetries, retryWait: retryWait, maxRetryWait: maxRetryWait}, nil
+	now := config.Now
+	if now == nil {
+		now = time.Now
+	}
+	sleep := config.Sleep
+	if sleep == nil {
+		sleep = func(ctx context.Context, delay time.Duration) bool {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+	}
+	limiter := &searchLimiter{now: now, sleep: sleep, limit: 10}
+	return &GitHubClient{baseURL: base, token: config.Token, httpClient: client, concurrency: concurrency, maxRetries: maxRetries, retryWait: retryWait, maxRetryWait: maxRetryWait, searchLimit: limiter}, nil
 }
 
 func (c *GitHubClient) Search(ctx context.Context, query string) GitHubSearchResult {
@@ -162,6 +191,12 @@ func (c *GitHubClient) Search(ctx context.Context, query string) GitHubSearchRes
 			break
 		}
 		seenPages[next] = true
+		if !c.searchLimit.wait(ctx) {
+			result.Failures = append(result.Failures, GitHubFailure{Kind: "throttled", Retryable: true, Message: "GitHub code-search budget wait was canceled"})
+			result.Coverage.Status = GitHubPartial
+			result.Coverage.Throttled = true
+			break
+		}
 		response, pageItems, pageNext, failure := c.searchPage(ctx, next)
 		result.Coverage.Pages++
 		if failure != nil {
@@ -237,15 +272,51 @@ func validateGitHubQuery(query string) error {
 }
 
 func githubSearchCharacters(query string) int {
+	qualifiers := []string{"repo:", "org:", "user:", "path:", "filename:", "extension:", "language:", "in:", "is:", "size:"}
 	count := 0
 	for _, token := range strings.Fields(query) {
 		lower := strings.ToLower(token)
-		if lower == "and" || lower == "or" || lower == "not" || strings.Contains(token, ":") {
+		documented := false
+		for _, qualifier := range qualifiers {
+			if strings.HasPrefix(lower, qualifier) {
+				documented = true
+				break
+			}
+		}
+		if lower == "and" || lower == "or" || lower == "not" || documented {
 			continue
 		}
 		count += utf8.RuneCountInString(token)
 	}
 	return count
+}
+
+func (l *searchLimiter) wait(ctx context.Context) bool {
+	for {
+		now := l.now()
+		l.mu.Lock()
+		cutoff := now.Add(-time.Minute)
+		kept := l.starts[:0]
+		for _, start := range l.starts {
+			if start.After(cutoff) {
+				kept = append(kept, start)
+			}
+		}
+		l.starts = kept
+		if len(l.starts) < l.limit {
+			l.starts = append(l.starts, now)
+			l.mu.Unlock()
+			return true
+		}
+		delay := l.starts[0].Add(time.Minute).Sub(now)
+		if delay < 0 {
+			delay = 0
+		}
+		l.mu.Unlock()
+		if !l.sleep(ctx, delay) {
+			return false
+		}
+	}
 }
 
 func (c *GitHubClient) searchURL(query, page string) string {

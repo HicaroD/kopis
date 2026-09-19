@@ -41,6 +41,9 @@ type GitLabConfig struct {
 	MaxRetries   int
 	RetryWait    time.Duration
 	MaxRetryWait time.Duration
+	Now          func() time.Time
+	Sleep        func(context.Context, time.Duration) bool
+	Capabilities *GitLabCapabilities
 }
 
 // GitLabCapabilities describes instance features that affect blob discovery.
@@ -107,6 +110,8 @@ type GitLabClient struct {
 	maxRetries   int
 	retryWait    time.Duration
 	maxRetryWait time.Duration
+	searchLimit  *searchLimiter
+	capabilities *GitLabCapabilities
 }
 
 // NewGitLabClient creates an authenticated client without making a request.
@@ -138,15 +143,42 @@ func NewGitLabClient(config GitLabConfig) (*GitLabClient, error) {
 	if maxRetryWait <= 0 {
 		maxRetryWait = time.Second
 	}
-	return &GitLabClient{baseURL: base, token: config.Token, httpClient: client, concurrency: concurrency, maxRetries: maxRetries, retryWait: retryWait, maxRetryWait: maxRetryWait}, nil
+	now := config.Now
+	if now == nil {
+		now = time.Now
+	}
+	sleep := config.Sleep
+	if sleep == nil {
+		sleep = func(ctx context.Context, delay time.Duration) bool {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+	}
+	limiter := &searchLimiter{now: now, sleep: sleep, limit: 100}
+	return &GitLabClient{baseURL: base, token: config.Token, httpClient: client, concurrency: concurrency, maxRetries: maxRetries, retryWait: retryWait, maxRetryWait: maxRetryWait, searchLimit: limiter, capabilities: config.Capabilities}, nil
 }
 
 // Capabilities reports the portable GitLab search boundary. GitLab.com does
 // not expose a global code-search endpoint; callers must supply a project or
 // group scope there.
 func (c *GitLabClient) Capabilities(ctx context.Context) (GitLabCapabilities, *GitLabFailure) {
-	result := GitLabCapabilities{AdvancedSearch: true, ExactCodeSearch: true, SearchAvailable: true, IndexLimitBytes: gitLabIndexLimit, ResultLimit: gitLabResultCap}
+	if c == nil || c.baseURL == nil {
+		return GitLabCapabilities{}, &GitLabFailure{Kind: "unavailable", Message: "GitLab instance is unavailable"}
+	}
+	if c.capabilities != nil {
+		return *c.capabilities, nil
+	}
+	result := GitLabCapabilities{IndexLimitBytes: gitLabIndexLimit, ResultLimit: gitLabResultCap}
 	if strings.EqualFold(c.baseURL.Hostname(), "gitlab.com") {
+		result.AdvancedSearch = true
+		result.ExactCodeSearch = true
+		result.SearchAvailable = true
 		result.GlobalSearch = false
 	} else {
 		result.GlobalSearch = false
@@ -199,9 +231,22 @@ func (c *GitLabClient) search(ctx context.Context, search string, scope GitLabSc
 	}
 
 	var blobs []GitLabBlob
+	more := false
+	truncated := false
 	for page := 1; len(blobs) < gitLabResultCap; page++ {
+		if !c.searchLimit.wait(ctx) {
+			result.Failures = append(result.Failures, GitLabFailure{Kind: "throttled", Retryable: true, Message: "GitLab search budget wait was canceled"})
+			result.Coverage.Status = GitLabPartial
+			result.Coverage.Throttled = true
+			break
+		}
 		pageBlobs, next, failure := c.searchPage(ctx, search, scope, page)
 		result.Coverage.Pages++
+		remaining := gitLabResultCap - len(blobs)
+		if len(pageBlobs) > remaining {
+			pageBlobs = pageBlobs[:remaining]
+			truncated = true
+		}
 		blobs = append(blobs, pageBlobs...)
 		if failure != nil {
 			result.Failures = append(result.Failures, *failure)
@@ -218,8 +263,9 @@ func (c *GitLabClient) search(ctx context.Context, search string, scope GitLabSc
 		if !next {
 			break
 		}
+		more = true
 	}
-	if len(blobs) >= gitLabResultCap {
+	if (more || truncated) && len(blobs) >= gitLabResultCap {
 		result.Coverage.ResultCapReached = true
 		result.Coverage.Status = GitLabPartial
 	}

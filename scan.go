@@ -130,6 +130,13 @@ func Scan(ctx context.Context, request ScanRequest) (ScanResult, error) {
 		var err error
 		repositories, err = request.Scanner.Discover(ctx, request.Token)
 		if err != nil {
+			if request.Scope.Kind != ScopeDefault {
+				results := make([]RepositoryResult, 0, len(request.Scope.RepositoryIDs))
+				for _, id := range request.Scope.RepositoryIDs {
+					results = append(results, RepositoryResult{Repository: Repository{Provider: request.Provider, ID: id}, Status: RepositoryUnscanned})
+				}
+				return ScanResult{Repositories: results}, nil
+			}
 			return ScanResult{}, errors.New("repository discovery failed")
 		}
 	}
@@ -205,8 +212,10 @@ func selectRepositories(repositories []Repository, provider string, scope Scope)
 			continue
 		}
 		if scope.Kind == ScopeDefault {
-			if repository.Owner || repository.Member || repository.Collaborator {
+			if (repository.Owner || repository.Member || repository.Collaborator) && repository.Accessible {
 				selected = append(selected, repository)
+			} else if repository.Owner || repository.Member || repository.Collaborator {
+				invalid = append(invalid, RepositoryResult{Repository: repository})
 			}
 			continue
 		}
@@ -238,13 +247,12 @@ func scanRepository(ctx context.Context, request ScanRequest, repository Reposit
 		return result
 	}
 	seen := make(map[string]bool)
-	started, incomplete, foundArtifact := false, false, false
+	started, incomplete, foundCandidate := false, false, false
 	for _, artifact := range request.Catalog {
 		query := catalogQuery(request.Provider, artifact)
 		if query == "" {
 			continue
 		}
-		foundArtifact = true
 		started = true
 		outcome := request.Scanner.Search(ctx, request.Token, repository, query, artifact)
 		if !outcome.Complete || outcome.Unavailable {
@@ -266,15 +274,16 @@ func scanRepository(ctx context.Context, request ScanRequest, repository Reposit
 				continue
 			}
 			seen[key] = true
+			foundCandidate = true
 			result.Findings = append(result.Findings, InspectCandidate(candidate)...)
 		}
 	}
 	if incomplete {
 		result.Status = RepositoryPartial
-	} else if len(result.Findings) > 0 {
+	} else if foundCandidate || len(result.Findings) > 0 {
 		result.Status = RepositoryNoFindings
-	} else if started && foundArtifact {
-		result.Status = RepositoryNoFindings
+	} else if started {
+		result.Status = RepositoryNoCandidateArtifacts
 	}
 	return result
 }
