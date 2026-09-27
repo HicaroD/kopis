@@ -102,6 +102,9 @@ type ScanRequest struct {
 	Repositories []Repository
 	Scanner      ScanProvider
 	Concurrency  int
+	// Progress reports completed catalog searches out of the total planned.
+	// Callbacks may be invoked by multiple scan workers.
+	Progress func(completed, total int)
 }
 
 type RepositoryResult struct {
@@ -203,6 +206,26 @@ func scanSelectedRepositories(ctx context.Context, request ScanRequest, selected
 	if workers > len(selected) {
 		workers = len(selected)
 	}
+	searchesPerRepository := 0
+	for _, artifact := range request.Catalog {
+		if catalogQuery(request.Provider, artifact) != "" {
+			searchesPerRepository++
+		}
+	}
+	total := searchesPerRepository * len(selected)
+	var progressMu sync.Mutex
+	completed := 0
+	progress := func() {
+		if request.Progress != nil {
+			progressMu.Lock()
+			defer progressMu.Unlock()
+			completed++
+			request.Progress(completed, total)
+		}
+	}
+	if request.Progress != nil {
+		request.Progress(0, total)
+	}
 	type indexed struct {
 		index  int
 		result RepositoryResult
@@ -215,7 +238,7 @@ func scanSelectedRepositories(ctx context.Context, request ScanRequest, selected
 		go func() {
 			defer wait.Done()
 			for job := range jobs {
-				output <- indexed{index: job.index, result: scanRepository(ctx, request, job.result.Repository)}
+				output <- indexed{index: job.index, result: scanRepository(ctx, request, job.result.Repository, progress)}
 			}
 		}()
 	}
@@ -280,7 +303,7 @@ func containsRepository(repositories []Repository, id string) bool {
 	return false
 }
 
-func scanRepository(ctx context.Context, request ScanRequest, repository Repository) RepositoryResult {
+func scanRepository(ctx context.Context, request ScanRequest, repository Repository, progress func()) RepositoryResult {
 	result := RepositoryResult{Repository: repository, Status: RepositoryNoCandidateArtifacts}
 	if !repository.Accessible && request.Scope.Kind != ScopeDefault {
 		result.Status = RepositoryUnscanned
@@ -289,12 +312,17 @@ func scanRepository(ctx context.Context, request ScanRequest, repository Reposit
 	seen := make(map[string]bool)
 	started, incomplete, foundCandidate := false, false, false
 	for _, artifact := range request.Catalog {
+		if ctx.Err() != nil {
+			result.Status = RepositoryPartial
+			return result
+		}
 		query := catalogQuery(request.Provider, artifact)
 		if query == "" {
 			continue
 		}
 		started = true
 		outcome := request.Scanner.Search(ctx, request.Token, repository, query, artifact)
+		progress()
 		if !outcome.Complete || outcome.Unavailable {
 			incomplete = true
 		}

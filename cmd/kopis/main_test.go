@@ -63,7 +63,7 @@ func TestRunExplicitStandardInputScopeForBothProviders(t *testing.T) {
 			defer os.Unsetenv(env)
 			var output, errors bytes.Buffer
 			status := run([]string{"-provider", provider, "-base-url", server.URL, "-scope-file", "-", "-format", "jsonl"}, strings.NewReader("team/repo\n"), &output, &errors)
-			if status == 0 || errors.Len() != 0 || !strings.Contains(output.String(), "unscanned") || strings.Contains(output.String(), "runtime-token") {
+			if status == 0 || !strings.Contains(output.String(), "unscanned") || strings.Contains(output.String()+errors.String(), "runtime-token") {
 				t.Fatalf("explicit scope journey leaked or returned success: status=%d output=%q errors=%q", status, output.String(), errors.String())
 			}
 		})
@@ -118,7 +118,7 @@ func TestRunExplicitScopeSearchesRepositoryOutsideDefaultDiscovery(t *testing.T)
 				defer os.Unsetenv(env)
 				var output, errors bytes.Buffer
 				status := run([]string{"-provider", provider, "-base-url", server.URL, "-scope", "team/explicit", "-format", format}, strings.NewReader(""), &output, &errors)
-				if status != 0 || discoveryCalled || errors.Len() != 0 || !strings.Contains(output.String(), "team/explicit") || strings.Contains(output.String(), "literal-secret") || strings.Contains(output.String(), "runtime-token") {
+				if status != 0 || discoveryCalled || !strings.Contains(output.String(), "team/explicit") || strings.Contains(output.String()+errors.String(), "literal-secret") || strings.Contains(output.String()+errors.String(), "runtime-token") {
 					t.Fatalf("explicit journey failed or leaked protected data: status=%d output=%q errors=%q", status, output.String(), errors.String())
 				}
 			})
@@ -133,6 +133,149 @@ type runtimeJourneyServer struct {
 	resolutions    []string
 	defaultCalls   int
 	invalidRequest string
+}
+
+type progressWriter struct{ messages chan string }
+
+func (w progressWriter) Write(p []byte) (int, error) {
+	w.messages <- string(p)
+	return len(p), nil
+}
+
+func TestRunReportsProgressBeforeScanCompletes(t *testing.T) {
+	installFastGitHubLimiter(t)
+	secondSearch := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseScan := func() { releaseOnce.Do(func() { close(release) }) }
+	var searches atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/repos":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"full_name": "team/repo"}})
+		case "/search/code":
+			if searches.Add(1) == 2 {
+				close(secondSearch)
+				<-release
+			}
+			_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer func() {
+		releaseScan()
+		server.Close()
+	}()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	var output bytes.Buffer
+	messages := make(chan string, 100)
+	done := make(chan int, 1)
+	go func() {
+		done <- run([]string{"-provider", "github", "-base-url", server.URL, "-format", "jsonl"}, strings.NewReader(""), &output, progressWriter{messages})
+	}()
+	select {
+	case <-secondSearch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scan did not start its second search")
+	}
+	// A completed search must already have produced a progress update, even
+	// while the next request is still pending.
+	deadline := time.After(2 * time.Second)
+waitForProgress:
+	for {
+		select {
+		case message := <-messages:
+			if strings.Contains(message, "catalog searches 1/17 complete") {
+				break waitForProgress
+			}
+		case <-deadline:
+			t.Fatal("completed search reported no progress while next search was pending")
+		}
+	}
+	if output.Len() != 0 {
+		t.Fatal("final output was written before scan completed")
+	}
+	releaseScan()
+	select {
+	case status := <-done:
+		if status != 0 {
+			t.Fatalf("scan returned %d", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("scan did not finish")
+	}
+	var result kopis.Presentation
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil || len(result.Repositories) != 1 {
+		t.Fatalf("final JSONL output changed: %q, err=%v", output.String(), err)
+	}
+}
+
+func TestRunStopsWhenProviderDiscoveryIsCanceled(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer func() { close(release); server.Close() }()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var output, errors bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- runContext(ctx, []string{"-provider", "github", "-base-url", server.URL}, strings.NewReader(""), &output, &errors)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider request did not start")
+	}
+	cancel()
+	select {
+	case status := <-done:
+		if status == 0 || !strings.Contains(errors.String(), "canceled") {
+			t.Fatalf("canceled scan returned status=%d stderr=%q", status, errors.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceling provider discovery did not stop the CLI")
+	}
+}
+
+func TestRuntimeDiscoveryHonorsHTTPTimeout(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer func() { close(release); server.Close() }()
+	provider := runtimeProvider{provider: kopis.GitHubProvider, baseURL: server.URL, httpClient: &http.Client{Timeout: 50 * time.Millisecond}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := provider.Discover(context.Background(), "runtime-token")
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("discovery did not start")
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("discovery did not time out")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed-out discovery did not return")
+	}
 }
 
 func (s *runtimeJourneyServer) handler(w http.ResponseWriter, r *http.Request) {
@@ -300,7 +443,7 @@ func TestRunCompleteAndIncompleteJourneysThroughRuntimeAdapters(t *testing.T) {
 				server.Close()
 				_ = os.Unsetenv(env)
 				defaultCalls, resolutions, queries, invalid := journey.snapshot()
-				if status != 2 || errors.Len() != 0 || invalid != "" {
+				if status != 2 || strings.Contains(errors.String(), "runtime-token") || invalid != "" {
 					t.Fatalf("%s/%s/%s did not report incomplete journey: status=%d output=%q errors=%q default_calls=%d resolutions=%v invalid=%q", provider, scopeMode, format, status, output.String(), errors.String(), defaultCalls, resolutions, invalid)
 				}
 				if scopeMode == "default" && defaultCalls == 0 {
