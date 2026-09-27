@@ -21,15 +21,19 @@ func (p journeyProvider) Discover(context.Context, string) ([]Repository, error)
 	}, nil
 }
 
-func (p journeyProvider) Search(_ context.Context, _ string, repository Repository, _ string, artifact Artifact) SearchOutcome {
+func (p journeyProvider) ListFiles(_ context.Context, _ string, repository Repository) FileListing {
 	switch repository.ID {
 	case "complete/repository":
-		return SearchOutcome{Complete: true, Candidates: []Candidate{{Provider: p.provider, Repository: repository.ID, RepositoryURL: "https://user:secret@example.test/repository", Revision: "pinned", Path: artifact.Path, Tool: artifact.Rule.Tool, CatalogRule: artifact.Rule.ID, Content: "provider_api_key=literal-secret"}}}
+		return FileListing{Complete: true, Files: []RepositoryFile{{Path: "opencode.json", Revision: "pinned"}}}
 	case "partial/repository":
-		return SearchOutcome{Complete: false}
+		return FileListing{Complete: false}
 	default:
-		return SearchOutcome{Complete: true}
+		return FileListing{Complete: true}
 	}
+}
+
+func (p journeyProvider) FetchFile(context.Context, string, Repository, RepositoryFile) FileOutcome {
+	return FileOutcome{Complete: true, Content: "provider_api_key=literal-secret"}
 }
 
 func TestDeterministicProviderJourneysReachRedactedOutputs(t *testing.T) {

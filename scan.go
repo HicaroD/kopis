@@ -72,20 +72,31 @@ func ParseScope(reader io.Reader) (Scope, error) {
 	return Scope{Kind: kind, RepositoryIDs: ids}, nil
 }
 
-// SearchOutcome is the provider-neutral result of one catalog-derived search.
-type SearchOutcome struct {
-	Candidates  []Candidate
-	Complete    bool
-	Denied      bool
-	Unavailable bool
+// RepositoryFile is a path on a pinned default-branch tree. Revision is the
+// blob identity for GitHub and the commit identity for GitLab.
+type RepositoryFile struct {
+	Path     string
+	Revision string
 }
 
-// ScanProvider supplies authorization-aware repository discovery and
-// catalog-only searches. Implementations must not return protected content in
-// errors or discovery failures.
+type FileListing struct {
+	Files    []RepositoryFile
+	Complete bool
+	Denied   bool
+}
+
+type FileOutcome struct {
+	Content  string
+	Complete bool
+	Denied   bool
+}
+
+// ScanProvider supplies authorization-aware discovery, a default-branch path
+// inventory and pinned file retrieval.
 type ScanProvider interface {
 	Discover(ctx context.Context, token string) ([]Repository, error)
-	Search(ctx context.Context, token string, repository Repository, query string, artifact Artifact) SearchOutcome
+	ListFiles(ctx context.Context, token string, repository Repository) FileListing
+	FetchFile(ctx context.Context, token string, repository Repository, file RepositoryFile) FileOutcome
 }
 
 // ExplicitRepositoryProvider resolves an explicitly requested repository
@@ -102,7 +113,7 @@ type ScanRequest struct {
 	Repositories []Repository
 	Scanner      ScanProvider
 	Concurrency  int
-	// Progress reports completed catalog searches out of the total planned.
+	// Progress reports completed repositories out of the total selected.
 	// Callbacks may be invoked by multiple scan workers.
 	Progress func(completed, total int)
 }
@@ -206,13 +217,7 @@ func scanSelectedRepositories(ctx context.Context, request ScanRequest, selected
 	if workers > len(selected) {
 		workers = len(selected)
 	}
-	searchesPerRepository := 0
-	for _, artifact := range request.Catalog {
-		if catalogQuery(request.Provider, artifact) != "" {
-			searchesPerRepository++
-		}
-	}
-	total := searchesPerRepository * len(selected)
+	total := len(selected)
 	var progressMu sync.Mutex
 	completed := 0
 	progress := func() {
@@ -304,64 +309,89 @@ func containsRepository(repositories []Repository, id string) bool {
 }
 
 func scanRepository(ctx context.Context, request ScanRequest, repository Repository, progress func()) RepositoryResult {
+	defer progress()
 	result := RepositoryResult{Repository: repository, Status: RepositoryNoCandidateArtifacts}
 	if !repository.Accessible && request.Scope.Kind != ScopeDefault {
 		result.Status = RepositoryUnscanned
 		return result
 	}
-	seen := make(map[string]bool)
-	started, incomplete, foundCandidate := false, false, false
-	for _, artifact := range request.Catalog {
-		if ctx.Err() != nil {
-			result.Status = RepositoryPartial
-			return result
-		}
-		query := catalogQuery(request.Provider, artifact)
-		if query == "" {
-			continue
-		}
-		started = true
-		outcome := request.Scanner.Search(ctx, request.Token, repository, query, artifact)
-		progress()
-		if !outcome.Complete || outcome.Unavailable {
+	listing := request.Scanner.ListFiles(ctx, request.Token, repository)
+	if listing.Denied {
+		result.Status = RepositoryUnscanned
+		return result
+	}
+	incomplete := !listing.Complete
+	files := make(map[string]RepositoryFile, len(listing.Files))
+	contents := make(map[string]string, len(listing.Files))
+	for _, file := range listing.Files {
+		if file.Path != "" && file.Revision != "" {
+			files[file.Path] = file
+			contents[file.Path] = ""
+		} else {
 			incomplete = true
 		}
-		if outcome.Denied {
-			result.Status = RepositoryUnscanned
-			return result
+	}
+	queue := catalogPathCandidates(contents, request.Catalog)
+	fetched := make(map[string]bool)
+	successful := make(map[string]bool)
+	deferred := make(map[string][]Artifact)
+	inspected := make(map[string]bool)
+	admitted := false
+	inspect := func(artifact Artifact) {
+		key := artifact.Path + "\x00" + artifact.Rule.ID
+		if inspected[key] {
+			return
 		}
-		for _, candidate := range outcome.Candidates {
-			if candidate.Provider == "" {
-				candidate.Provider = request.Provider
-			}
-			if candidate.Repository == "" {
-				candidate.Repository = repository.ID
-			}
-			key := strings.Join([]string{candidate.Provider, candidate.Repository, candidate.Revision, candidate.Path}, "\x00")
-			if seen[key] {
+		inspected[key] = true
+		admitted = true
+		result.Findings = append(result.Findings, inspectListedFile(request.Provider, repository, files[artifact.Path], artifact, contents[artifact.Path])...)
+	}
+	for len(queue) > 0 {
+		if ctx.Err() != nil {
+			incomplete = true
+			break
+		}
+		file := queue[0]
+		queue = queue[1:]
+		if fetched[file] {
+			continue
+		}
+		fetched[file] = true
+		outcome := request.Scanner.FetchFile(ctx, request.Token, repository, files[file])
+		if !outcome.Complete {
+			incomplete = true
+			continue
+		}
+		successful[file] = true
+		contents[file] = outcome.Content
+		artifacts := append(RecognizeArtifact(file, contents), deferred[file]...)
+		for _, artifact := range artifacts {
+			if !catalogAllowsArtifact(request.Catalog, artifact) {
 				continue
 			}
-			seen[key] = true
-			foundCandidate = true
-			result.Findings = append(result.Findings, InspectCandidate(candidate)...)
+			if artifact.Path != file {
+				if _, exists := files[artifact.Path]; exists {
+					if successful[artifact.Path] {
+						inspect(artifact)
+					} else if !fetched[artifact.Path] {
+						deferred[artifact.Path] = append(deferred[artifact.Path], artifact)
+						queue = append(queue, artifact.Path)
+					}
+				}
+				continue
+			}
+			inspect(artifact)
 		}
 	}
 	if incomplete {
 		result.Status = RepositoryPartial
-	} else if foundCandidate || len(result.Findings) > 0 {
+	} else if admitted {
 		result.Status = RepositoryNoFindings
-	} else if started {
-		result.Status = RepositoryNoCandidateArtifacts
 	}
 	return result
 }
 
-func catalogQuery(provider string, artifact Artifact) string {
-	if artifact.Path == "" {
-		return ""
-	}
-	if provider == GitHubProvider {
-		return "path:" + artifact.Path
-	}
-	return artifact.Path
+func inspectListedFile(provider string, repository Repository, file RepositoryFile, artifact Artifact, content string) []Finding {
+	return InspectCandidate(Candidate{Provider: provider, Repository: repository.ID, RepositoryURL: repository.URL,
+		Revision: file.Revision, Path: file.Path, Content: content, Tool: artifact.Rule.Tool, CatalogRule: artifact.Rule.ID})
 }

@@ -26,8 +26,6 @@ type runtimeProvider struct {
 	gitlab     *kopis.GitLabClient
 }
 
-var newGitHubRuntimeClient = kopis.NewGitHubClient
-
 func (p runtimeProvider) ResolveRepository(ctx context.Context, token, id string) (kopis.Repository, error) {
 	path := "/repos/" + strings.TrimPrefix(strings.TrimSpace(id), "/")
 	if p.provider == kopis.GitLabProvider {
@@ -153,13 +151,18 @@ func discoveryNext(link string) string {
 	return ""
 }
 
-func (p runtimeProvider) Search(ctx context.Context, token string, repository kopis.Repository, query string, artifact kopis.Artifact) kopis.SearchOutcome {
+func (p runtimeProvider) ListFiles(ctx context.Context, _ string, repository kopis.Repository) kopis.FileListing {
 	if p.provider == kopis.GitHubProvider {
-		result := p.github.SearchCatalog(ctx, query+" repo:"+repository.ID, artifact)
-		return kopis.SearchOutcome{Candidates: result.Candidates, Complete: result.Coverage.Status == kopis.GitHubComplete, Denied: result.Coverage.Status == kopis.GitHubUnscanned && result.Coverage.AccessAmbiguous, Unavailable: result.Coverage.Status == kopis.GitHubPartial}
+		return p.github.ListFiles(ctx, repository.ID)
 	}
-	result := p.gitlab.SearchCatalog(ctx, query, artifact, kopis.GitLabScope{Project: repository.ID})
-	return kopis.SearchOutcome{Candidates: result.Candidates, Complete: result.Coverage.Status == kopis.GitLabComplete, Denied: result.Coverage.Status == kopis.GitLabUnscanned && result.Coverage.AccessAmbiguous, Unavailable: result.Coverage.Status == kopis.GitLabPartial}
+	return p.gitlab.ListFiles(ctx, repository.ID)
+}
+
+func (p runtimeProvider) FetchFile(ctx context.Context, _ string, repository kopis.Repository, file kopis.RepositoryFile) kopis.FileOutcome {
+	if p.provider == kopis.GitHubProvider {
+		return p.github.FetchFile(ctx, repository.ID, file)
+	}
+	return p.gitlab.FetchFile(ctx, repository.ID, file)
 }
 
 func (p runtimeProvider) http() *http.Client {
@@ -225,7 +228,7 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	provider := runtimeProvider{provider: *providerName, token: token, baseURL: apiURL, httpClient: client}
 	var err error
 	if *providerName == kopis.GitHubProvider {
-		provider.github, err = newGitHubRuntimeClient(kopis.GitHubConfig{BaseURL: apiURL, Token: token, HTTPClient: client})
+		provider.github, err = kopis.NewGitHubClient(kopis.GitHubConfig{BaseURL: apiURL, Token: token, HTTPClient: client})
 	} else {
 		provider.gitlab, err = kopis.NewGitLabClient(kopis.GitLabConfig{BaseURL: apiURL, Token: token, HTTPClient: client})
 	}
@@ -254,12 +257,9 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		}
 	}
 	request.Progress = func(completed, total int) {
-		fmt.Fprintf(stderr, "kopis: catalog searches %d/%d complete\n", completed, total)
+		fmt.Fprintf(stderr, "kopis: repositories %d/%d complete\n", completed, total)
 	}
 	fmt.Fprintln(stderr, "kopis: preparing repository scope...")
-	if *providerName == kopis.GitHubProvider {
-		fmt.Fprintln(stderr, "kopis: GitHub search is limited to 10 requests/minute; pauses of up to a minute are expected")
-	}
 	result, err := kopis.Scan(ctx, request)
 	if ctx.Err() != nil {
 		fmt.Fprintln(stderr, "kopis: scan canceled")

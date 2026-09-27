@@ -10,7 +10,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,7 +70,6 @@ func TestRunExplicitStandardInputScopeForBothProviders(t *testing.T) {
 }
 
 func TestRunExplicitScopeSearchesRepositoryOutsideDefaultDiscovery(t *testing.T) {
-	installFastGitHubLimiter(t)
 	for _, provider := range []string{"github", "gitlab"} {
 		for _, format := range []string{"terminal", "jsonl"} {
 			t.Run(provider+"/"+format, func(t *testing.T) {
@@ -82,23 +80,31 @@ func TestRunExplicitScopeSearchesRepositoryOutsideDefaultDiscovery(t *testing.T)
 						t.Fatal("explicit scope used default discovery")
 					}
 					if provider == "github" && r.URL.Path == "/repos/team/explicit" {
-						_ = json.NewEncoder(w).Encode(map[string]any{"full_name": "team/explicit", "html_url": "https://github.test/team/explicit", "private": false})
+						_ = json.NewEncoder(w).Encode(map[string]any{"full_name": "team/explicit", "html_url": "https://github.test/team/explicit", "private": false, "default_branch": "main"})
 						return
 					}
-					if provider == "gitlab" && strings.Contains(r.URL.Path, "/api/v4/projects/") && !strings.HasSuffix(r.URL.Path, "/search") && !strings.HasSuffix(r.URL.Path, "/raw") {
-						_ = json.NewEncoder(w).Encode(map[string]any{"path_with_namespace": "team/explicit", "web_url": "https://gitlab.test/team/explicit", "visibility": "public"})
+					if provider == "gitlab" && r.URL.Path == "/api/v4/projects/team/explicit" {
+						_ = json.NewEncoder(w).Encode(map[string]any{"path_with_namespace": "team/explicit", "web_url": "https://gitlab.test/team/explicit", "visibility": "public", "default_branch": "main"})
 						return
 					}
-					if strings.HasSuffix(r.URL.Path, "/search/code") {
-						_, _ = w.Write([]byte(`{"total_count":1,"incomplete_results":false,"items":[{"path":"opencode.json","sha":"abc123","html_url":"https://github.test/team/explicit/blob/abc123/opencode.json","repository":{"full_name":"team/explicit","html_url":"https://github.test/team/explicit"}}]}`))
+					if provider == "github" && strings.HasSuffix(r.URL.Path, "/commits/main") {
+						_, _ = w.Write([]byte(`{"sha":"commit-1","commit":{"tree":{"sha":"tree-1"}}}`))
+						return
+					}
+					if provider == "github" && strings.HasSuffix(r.URL.Path, "/git/trees/tree-1") {
+						_, _ = w.Write([]byte(`{"tree":[{"path":"opencode.json","type":"blob","sha":"abc123"}]}`))
 						return
 					}
 					if provider == "github" && strings.Contains(r.URL.Path, "/git/blobs/") {
 						_ = json.NewEncoder(w).Encode(map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte("api_key=literal-secret"))})
 						return
 					}
-					if strings.HasSuffix(r.URL.Path, "/search") {
-						_ = json.NewEncoder(w).Encode([]map[string]any{{"project_id": "42", "project_path": "team/explicit", "project_web_url": "https://gitlab.test/team/explicit", "path": "opencode.json", "ref": "main", "blob_id": "abc123", "size": 22}})
+					if provider == "gitlab" && strings.HasSuffix(r.URL.Path, "/repository/commits/main") {
+						_, _ = w.Write([]byte(`{"id":"commit-1"}`))
+						return
+					}
+					if provider == "gitlab" && strings.HasSuffix(r.URL.Path, "/repository/tree") {
+						_, _ = w.Write([]byte(`[{"path":"opencode.json","type":"blob"}]`))
 						return
 					}
 					if provider == "gitlab" && strings.HasSuffix(r.URL.Path, "/raw") {
@@ -135,6 +141,15 @@ type runtimeJourneyServer struct {
 	invalidRequest string
 }
 
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 type progressWriter struct{ messages chan string }
 
 func (w progressWriter) Write(p []byte) (int, error) {
@@ -143,22 +158,24 @@ func (w progressWriter) Write(p []byte) (int, error) {
 }
 
 func TestRunReportsProgressBeforeScanCompletes(t *testing.T) {
-	installFastGitHubLimiter(t)
-	secondSearch := make(chan struct{})
+	secondListing := make(chan struct{})
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	releaseScan := func() { releaseOnce.Do(func() { close(release) }) }
-	var searches atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/user/repos":
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"full_name": "team/repo"}})
-		case "/search/code":
-			if searches.Add(1) == 2 {
-				close(secondSearch)
+		switch {
+		case r.URL.Path == "/user/repos":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"full_name": "team/one"}, {"full_name": "team/two"}})
+		case strings.HasSuffix(r.URL.Path, "/git/trees/tree-1"):
+			if strings.Contains(r.URL.Path, "/two/") {
+				close(secondListing)
 				<-release
 			}
-			_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+			_, _ = w.Write([]byte(`{"tree":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/commits/main"):
+			_, _ = w.Write([]byte(`{"sha":"commit-1","commit":{"tree":{"sha":"tree-1"}}}`))
+		case strings.HasPrefix(r.URL.Path, "/repos/"):
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -175,22 +192,21 @@ func TestRunReportsProgressBeforeScanCompletes(t *testing.T) {
 		done <- run([]string{"-provider", "github", "-base-url", server.URL, "-format", "jsonl"}, strings.NewReader(""), &output, progressWriter{messages})
 	}()
 	select {
-	case <-secondSearch:
+	case <-secondListing:
 	case <-time.After(2 * time.Second):
-		t.Fatal("scan did not start its second search")
+		t.Fatal("scan did not start its second listing")
 	}
-	// A completed search must already have produced a progress update, even
-	// while the next request is still pending.
+	// A completed repository must report progress while another is pending.
 	deadline := time.After(2 * time.Second)
 waitForProgress:
 	for {
 		select {
 		case message := <-messages:
-			if strings.Contains(message, "catalog searches 1/17 complete") {
+			if strings.Contains(message, "repositories 1/2 complete") {
 				break waitForProgress
 			}
 		case <-deadline:
-			t.Fatal("completed search reported no progress while next search was pending")
+			t.Fatal("completed repository reported no progress while next listing was pending")
 		}
 	}
 	if output.Len() != 0 {
@@ -206,7 +222,7 @@ waitForProgress:
 		t.Fatal("scan did not finish")
 	}
 	var result kopis.Presentation
-	if err := json.Unmarshal(output.Bytes(), &result); err != nil || len(result.Repositories) != 1 {
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil || len(result.Repositories) != 2 {
 		t.Fatalf("final JSONL output changed: %q, err=%v", output.String(), err)
 	}
 }
@@ -308,9 +324,23 @@ func (s *runtimeJourneyServer) handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *runtimeJourneyServer) github(w http.ResponseWriter, r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/repos/") && !strings.Contains(r.URL.Path, "/git/blobs/") && !strings.Contains(r.URL.Path, "/search/code") {
+	if strings.HasSuffix(r.URL.Path, "/git/trees/tree-1") {
+		if strings.Contains(r.URL.Path, "/partial/") {
+			_, _ = w.Write([]byte(`{"truncated":true,"tree":[]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"tree":[{"path":"opencode.json","type":"blob","sha":"pinned-revision"},{"path":".mcp.json","type":"blob","sha":"pinned-revision"},{"path":".codex/config.toml","type":"blob","sha":"pinned-revision"},{"path":".agents/mcp_config.json","type":"blob","sha":"pinned-revision"},{"path":".gemini/settings.json","type":"blob","sha":"pinned-revision"}]}`))
+		return
+	}
+	if strings.HasSuffix(r.URL.Path, "/commits/main") {
+		_, _ = w.Write([]byte(`{"sha":"pinned-revision","commit":{"tree":{"sha":"tree-1"}}}`))
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/repos/") && !strings.Contains(r.URL.Path, "/git/blobs/") {
 		repository := strings.TrimPrefix(r.URL.Path, "/repos/")
-		s.resolutions = append(s.resolutions, repository)
+		if !containsString(s.resolutions, repository) {
+			s.resolutions = append(s.resolutions, repository)
+		}
 		if strings.HasSuffix(repository, "/denied") {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -318,15 +348,12 @@ func (s *runtimeJourneyServer) github(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"full_name": repository,
 			"html_url":  "https://github.test/" + repository,
-			"private":   true,
+			"private":   true, "default_branch": "main",
 		})
 		return
 	}
-	if strings.HasSuffix(r.URL.Path, "/search/code") {
-		s.query(w, r.URL.Query().Get("q"), "github")
-		return
-	}
 	if strings.Contains(r.URL.Path, "/git/blobs/") {
+		s.queries = append(s.queries, "team/complete blob")
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"encoding": "base64",
 			"content":  base64.StdEncoding.EncodeToString([]byte("api_key=literal-secret")),
@@ -338,10 +365,23 @@ func (s *runtimeJourneyServer) github(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *runtimeJourneyServer) gitlab(w http.ResponseWriter, r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/api/v4/projects/") && !strings.HasSuffix(r.URL.Path, "/search") && !strings.Contains(r.URL.Path, "/repository/files/") {
+	if strings.HasSuffix(r.URL.Path, "/repository/commits/main") {
+		_, _ = w.Write([]byte(`{"id":"pinned-revision"}`))
+		return
+	}
+	if strings.HasSuffix(r.URL.Path, "/repository/tree") {
+		if strings.Contains(r.URL.Path, "/partial/") {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`[{"path":"opencode.json","type":"blob"},{"path":".mcp.json","type":"blob"},{"path":".codex/config.toml","type":"blob"},{"path":".agents/mcp_config.json","type":"blob"},{"path":".gemini/settings.json","type":"blob"}]`))
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/v4/projects/") && !strings.Contains(r.URL.Path, "/repository/") {
 		repository := strings.TrimPrefix(r.URL.Path, "/api/v4/projects/")
-		repository = strings.ReplaceAll(repository, "/", "/")
-		s.resolutions = append(s.resolutions, repository)
+		if !containsString(s.resolutions, repository) {
+			s.resolutions = append(s.resolutions, repository)
+		}
 		if strings.HasSuffix(repository, "/denied") {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -349,65 +389,17 @@ func (s *runtimeJourneyServer) gitlab(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"path_with_namespace": repository,
 			"web_url":             "https://gitlab.test/" + repository,
-			"visibility":          "private",
+			"visibility":          "private", "default_branch": "main",
 		})
 		return
 	}
-	if strings.HasSuffix(r.URL.Path, "/search") {
-		repository := strings.TrimPrefix(r.URL.Path, "/api/v4/projects/")
-		s.query(w, repository+" "+r.URL.Query().Get("search"), "gitlab")
-		return
-	}
 	if strings.Contains(r.URL.Path, "/repository/files/") && strings.HasSuffix(r.URL.Path, "/raw") {
+		s.queries = append(s.queries, "team/complete "+strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v4/projects/team/complete/repository/files/"), "/raw"))
 		_, _ = w.Write([]byte("api_key=literal-secret"))
 		return
 	}
 	s.invalidRequest = r.URL.Path
 	http.NotFound(w, r)
-}
-
-func (s *runtimeJourneyServer) query(w http.ResponseWriter, query, adapter string) {
-	s.queries = append(s.queries, query)
-	if strings.Contains(query, "team/denied") {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	if strings.Contains(query, "team/partial") {
-		if adapter == "github" {
-			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "incomplete_results": true, "items": []any{}})
-		} else {
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
-		return
-	}
-	path := catalogPath(query)
-	if path == "" {
-		if adapter == "github" {
-			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "incomplete_results": false, "items": []any{}})
-		} else {
-			_ = json.NewEncoder(w).Encode([]any{})
-		}
-		return
-	}
-	if adapter == "github" {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"total_count": 1,
-			"items":       []map[string]any{{"path": path, "sha": "pinned-revision", "repository": map[string]string{"full_name": "team/complete", "html_url": "https://user:secret@github.test/team/complete"}}},
-		})
-		return
-	}
-	_ = json.NewEncoder(w).Encode([]map[string]any{{"project_id": "1", "project_path": "team/complete", "project_web_url": "https://user:secret@gitlab.test/team/complete", "path": path, "ref": "pinned-revision", "blob_id": "blob-1", "size": 22}})
-}
-
-func catalogPath(query string) string {
-	for _, path := range []string{
-		"opencode.json", ".mcp.json", ".codex/config.toml", ".agents/mcp_config.json", ".gemini/settings.json",
-	} {
-		if strings.Contains(query, path) {
-			return path
-		}
-	}
-	return ""
 }
 
 func (s *runtimeJourneyServer) snapshot() (defaultCalls int, resolutions, queries []string, invalid string) {
@@ -417,8 +409,6 @@ func (s *runtimeJourneyServer) snapshot() (defaultCalls int, resolutions, querie
 }
 
 func TestRunCompleteAndIncompleteJourneysThroughRuntimeAdapters(t *testing.T) {
-	installFastGitHubLimiter(t)
-
 	for _, provider := range []string{"github", "gitlab"} {
 		for _, scopeMode := range []string{"default", "explicit"} {
 			var presentations map[string]kopis.Presentation
@@ -452,10 +442,8 @@ func TestRunCompleteAndIncompleteJourneysThroughRuntimeAdapters(t *testing.T) {
 				if scopeMode == "explicit" && (defaultCalls != 0 || len(resolutions) != 3) {
 					t.Fatalf("%s explicit journey used the wrong scope path: default_calls=%d resolutions=%v", provider, defaultCalls, resolutions)
 				}
-				for _, familyPath := range []string{"opencode.json", ".mcp.json", ".codex/config.toml", ".agents/mcp_config.json", ".gemini/settings.json"} {
-					if !containsQueryPath(queries, familyPath) {
-						t.Fatalf("%s/%s omitted catalog family %q from runtime searches: %v", provider, scopeMode, familyPath, queries)
-					}
+				if len(queries) != 5 {
+					t.Fatalf("%s/%s fetched %d files, want five: %v", provider, scopeMode, len(queries), queries)
 				}
 				if format == "jsonl" {
 					var presentation kopis.Presentation
@@ -465,6 +453,17 @@ func TestRunCompleteAndIncompleteJourneysThroughRuntimeAdapters(t *testing.T) {
 					presentations = map[string]kopis.Presentation{"jsonl": presentation}
 					if presentation.Complete || presentation.ExitCode != 2 || len(presentation.Repositories) != 3 || len(presentation.Findings) != 5 {
 						t.Fatalf("%s/%s JSONL omitted delivery semantics: %+v", provider, scopeMode, presentation)
+					}
+					for _, familyPath := range []string{"opencode.json", ".mcp.json", ".codex/config.toml", ".agents/mcp_config.json", ".gemini/settings.json"} {
+						found := false
+						for _, finding := range presentation.Findings {
+							if finding.Path == familyPath {
+								found = true
+							}
+						}
+						if !found {
+							t.Fatalf("%s/%s omitted catalog family %q", provider, scopeMode, familyPath)
+						}
 					}
 					for _, repository := range presentation.Repositories {
 						if repository.Status != kopis.RepositoryNoFindings && repository.Status != kopis.RepositoryPartial && repository.Status != kopis.RepositoryUnscanned {
@@ -493,26 +492,4 @@ func TestRunCompleteAndIncompleteJourneysThroughRuntimeAdapters(t *testing.T) {
 			}
 		}
 	}
-}
-
-func installFastGitHubLimiter(t *testing.T) {
-	t.Helper()
-	originalGitHubClient := newGitHubRuntimeClient
-	newGitHubRuntimeClient = func(config kopis.GitHubConfig) (*kopis.GitHubClient, error) {
-		var ticks int64
-		config.Now = func() time.Time {
-			return time.Unix(0, 0).Add(time.Duration(atomic.AddInt64(&ticks, 1)) * 2 * time.Minute)
-		}
-		return kopis.NewGitHubClient(config)
-	}
-	t.Cleanup(func() { newGitHubRuntimeClient = originalGitHubClient })
-}
-
-func containsQueryPath(queries []string, path string) bool {
-	for _, query := range queries {
-		if strings.Contains(query, path) && (strings.Contains(query, "team/complete") || strings.Contains(query, "team/partial") || strings.Contains(query, "team/denied")) {
-			return true
-		}
-	}
-	return false
 }

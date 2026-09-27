@@ -9,12 +9,32 @@ import (
 )
 
 type scanProvider struct {
-	mu           sync.Mutex
-	seenToken    []string
-	searches     []string
-	outcomes     map[string]SearchOutcome
-	repositories []Repository
-	discoverErr  error
+	mu            sync.Mutex
+	seenToken     []string
+	searches      []string
+	listings      map[string]FileListing
+	repositories  []Repository
+	discoverErr   error
+	listing       FileListing
+	contents      map[string]string
+	fetched       []string
+	fetchFailures map[string]bool
+}
+
+func (p *scanProvider) ListFiles(_ context.Context, token string, repository Repository) FileListing {
+	p.mu.Lock()
+	p.seenToken = append(p.seenToken, token)
+	p.mu.Unlock()
+	if p.listings != nil {
+		return p.listings[repository.ID]
+	}
+	return p.listing
+}
+func (p *scanProvider) FetchFile(_ context.Context, _ string, _ Repository, file RepositoryFile) FileOutcome {
+	p.mu.Lock()
+	p.fetched = append(p.fetched, file.Path)
+	p.mu.Unlock()
+	return FileOutcome{Content: p.contents[file.Path], Complete: !p.fetchFailures[file.Path]}
 }
 
 func (p *scanProvider) Discover(context.Context, string) ([]Repository, error) {
@@ -28,12 +48,11 @@ func (p *scanProvider) Discover(context.Context, string) ([]Repository, error) {
 	}, nil
 }
 
-func (p *scanProvider) Search(_ context.Context, token string, repository Repository, query string, _ Artifact) SearchOutcome {
+func (p *scanProvider) Search(_ context.Context, token string, repository Repository, query string, _ Artifact) {
 	p.mu.Lock()
 	p.seenToken = append(p.seenToken, token)
 	p.searches = append(p.searches, repository.ID+":"+query)
 	p.mu.Unlock()
-	return p.outcomes[repository.ID]
 }
 
 func TestScanRejectsMissingTokenBeforeDiscovery(t *testing.T) {
@@ -44,14 +63,89 @@ func TestScanRejectsMissingTokenBeforeDiscovery(t *testing.T) {
 	}
 }
 
+func TestScanListsPathsAndFetchesOnlyCatalogCandidates(t *testing.T) {
+	provider := &scanProvider{repositories: []Repository{{Provider: GitHubProvider, ID: "team/repo", Owner: true, Accessible: true}},
+		listing: FileListing{Complete: true, Files: []RepositoryFile{
+			{Path: ".opencode/plugins/custom.ts", Revision: "blob-1"},
+			{Path: "notes.txt", Revision: "blob-2"},
+		}}, contents: map[string]string{".opencode/plugins/custom.ts": "api_key=literal-secret"}}
+	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "runtime-token", Scanner: provider, Catalog: InitialCatalog()})
+	if err != nil || len(result.Findings) != 1 || result.Findings[0].CatalogRule != "opencode.plugin" || result.Repositories[0].Status != RepositoryNoFindings {
+		t.Fatalf("listing-based scan missed directory candidate: result=%+v err=%v", result, err)
+	}
+	if len(provider.searches) != 0 || len(provider.fetched) != 1 || provider.fetched[0] != ".opencode/plugins/custom.ts" {
+		t.Fatalf("scan searched or fetched unrelated files: searches=%v fetched=%v", provider.searches, provider.fetched)
+	}
+}
+
+func TestScanContentGatesAndFollowsOnlyListedSubstitutions(t *testing.T) {
+	provider := &scanProvider{repositories: []Repository{{Provider: GitHubProvider, ID: "team/repo", Owner: true, Accessible: true}},
+		listing: FileListing{Complete: true, Files: []RepositoryFile{
+			{Path: "opencode.json", Revision: "a"}, {Path: "secrets.txt", Revision: "b"},
+			{Path: ".github/workflows/build.yml", Revision: "c"}, {Path: "other.txt", Revision: "d"},
+		}}, contents: map[string]string{
+			"opencode.json": `{"instructions":["{file:secrets.txt}"]}`,
+			"secrets.txt":   "api_key=literal-secret", ".github/workflows/build.yml": "uses: actions/checkout@v4",
+		}}
+	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "runtime-token", Scanner: provider, Catalog: InitialCatalog()})
+	if err != nil || len(result.Findings) != 1 || result.Findings[0].CatalogRule != "opencode.file-substitution" {
+		t.Fatalf("substitution was not catalogued: result=%+v err=%v", result, err)
+	}
+	if len(provider.fetched) != 3 {
+		t.Fatalf("unrelated content fetched: %v", provider.fetched)
+	}
+}
+
+func TestScanUnrelatedWorkflowIsNotACandidate(t *testing.T) {
+	provider := &scanProvider{repositories: []Repository{{Provider: GitHubProvider, ID: "team/repo", Owner: true, Accessible: true}},
+		listing:  FileListing{Complete: true, Files: []RepositoryFile{{Path: ".github/workflows/build.yml", Revision: "abc"}}},
+		contents: map[string]string{".github/workflows/build.yml": "uses: actions/checkout@v4"}}
+	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "runtime-token", Scanner: provider, Catalog: InitialCatalog()})
+	if err != nil || result.Repositories[0].Status != RepositoryNoCandidateArtifacts {
+		t.Fatalf("unrelated workflow counted as catalog candidate: %+v err=%v", result, err)
+	}
+}
+
+func TestScanIncompleteListingOrFetchNeverClaimsFullCoverage(t *testing.T) {
+	for _, failing := range []string{"listing", "fetch"} {
+		t.Run(failing, func(t *testing.T) {
+			provider := &scanProvider{repositories: []Repository{{Provider: GitLabProvider, ID: "team/repo", Member: true, Accessible: true}},
+				listing:       FileListing{Complete: failing != "listing", Files: []RepositoryFile{{Path: "opencode.json", Revision: "commit"}, {Path: ".mcp.json", Revision: "commit"}}},
+				contents:      map[string]string{"opencode.json": "api_key=literal-secret", ".mcp.json": "api_key=another-secret"},
+				fetchFailures: map[string]bool{".mcp.json": failing == "fetch"},
+			}
+			result, err := Scan(context.Background(), ScanRequest{Provider: GitLabProvider, Token: "token", Scanner: provider, Catalog: InitialCatalog()})
+			if err != nil || result.Repositories[0].Status != RepositoryPartial || len(result.Findings) == 0 {
+				t.Fatalf("incomplete scan discarded findings or claimed full coverage: result=%+v err=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestScanSubstitutionStillAppliesWhenTargetWasFetchedFirst(t *testing.T) {
+	provider := &scanProvider{repositories: []Repository{{Provider: GitHubProvider, ID: "team/repo", Owner: true, Accessible: true}},
+		listing: FileListing{Complete: true, Files: []RepositoryFile{{Path: ".opencode/tools/secret.ts", Revision: "blob"}, {Path: "opencode.json", Revision: "config"}}},
+		contents: map[string]string{
+			".opencode/tools/secret.ts": "api_key=literal-secret", "opencode.json": `{"instructions":["{file:.opencode/tools/secret.ts}"]}`,
+		}}
+	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "token", Scanner: provider, Catalog: InitialCatalog()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := map[string]bool{}
+	for _, finding := range result.Findings {
+		rules[finding.CatalogRule] = true
+	}
+	if !rules["opencode.tool"] || !rules["opencode.file-substitution"] || len(provider.fetched) != 2 {
+		t.Fatalf("a prior fetch lost substitution attribution or fetched twice: findings=%+v fetched=%v", result.Findings, provider.fetched)
+	}
+}
+
 func TestScanFiltersDeduplicatesAndComposesRepositoryStatuses(t *testing.T) {
-	provider := &scanProvider{outcomes: map[string]SearchOutcome{
-		"owner/complete": {Complete: true, Candidates: []Candidate{
-			{Provider: GitHubProvider, Repository: "owner/complete", Revision: "rev", Path: "opencode.json", Content: `provider_api_key="literal-secret"`},
-			{Provider: GitHubProvider, Repository: "owner/complete", Revision: "rev", Path: "opencode.json", Content: `provider_api_key="literal-secret"`},
-		}},
+	provider := &scanProvider{listings: map[string]FileListing{
+		"owner/complete": {Complete: true, Files: []RepositoryFile{{Path: "opencode.json", Revision: "rev"}}},
 		"member/partial": {Complete: false},
-	}}
+	}, contents: map[string]string{"opencode.json": `provider_api_key="literal-secret"`}}
 	result, err := Scan(context.Background(), ScanRequest{
 		Provider:    GitHubProvider,
 		Token:       "runtime-token",
@@ -73,15 +167,13 @@ func TestScanFiltersDeduplicatesAndComposesRepositoryStatuses(t *testing.T) {
 			t.Fatalf("provider received an unexpected token")
 		}
 	}
-	for _, search := range provider.searches {
-		if !strings.HasSuffix(search, "path:opencode.json") {
-			t.Fatalf("search was not catalog-derived: %s", search)
-		}
+	if len(provider.searches) != 0 {
+		t.Fatalf("scan made code-search requests: %v", provider.searches)
 	}
 }
 
 func TestScanExcludesDeniedDefaultRepositories(t *testing.T) {
-	provider := &scanProvider{outcomes: map[string]SearchOutcome{"allowed/default": {Complete: true}}, repositories: []Repository{
+	provider := &scanProvider{listings: map[string]FileListing{"allowed/default": {Complete: true}}, repositories: []Repository{
 		{Provider: GitHubProvider, ID: "denied/default", Owner: true, Accessible: false},
 		{Provider: GitHubProvider, ID: "allowed/default", Member: true, Accessible: true},
 	}}

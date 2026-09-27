@@ -76,6 +76,69 @@ func CataloguedFiles(files map[string]string) []Artifact {
 	return result
 }
 
+// catalogPathCandidates is a conservative prefilter: content-gated workflows
+// are fetched before their action reference can be checked. Marker-backed
+// files are selected using the path inventory alone.
+func catalogPathCandidates(files map[string]string, catalog []Artifact) []string {
+	paths := make([]string, 0, len(files))
+	for filename := range files {
+		paths = append(paths, filename)
+	}
+	sort.Strings(paths)
+	var selected []string
+	for _, filename := range paths {
+		eligible := false
+		for _, artifact := range RecognizeArtifact(filename, files) {
+			if artifact.Path == filename && catalogAllowsArtifact(catalog, artifact) {
+				eligible = true
+			}
+		}
+		p := slashPath(filename)
+		if strings.HasPrefix(p, ".github/workflows/") && hasExtension(p, ".yml", ".yaml") &&
+			(catalogAllows(catalog, "opencode.workflow") || catalogAllows(catalog, "codex.workflow")) {
+			eligible = true
+		}
+		if eligible {
+			selected = append(selected, filename)
+		}
+	}
+	return selected
+}
+
+var parentCatalogRule = map[string]string{
+	"opencode.file-substitution": "opencode.config",
+	"claude.plugin-mcp":          "claude.mcp",
+	"gemini.extension-hooks":     "gemini.extension",
+	"gemini.extension-assets":    "gemini.extension",
+	"gemini.extension-env":       "gemini.extension",
+}
+
+func catalogAllows(catalog []Artifact, id string) bool {
+	parent := parentCatalogRule[id]
+	for _, artifact := range catalog {
+		if artifact.Rule.ID == id || parent != "" && artifact.Rule.ID == parent {
+			return true
+		}
+	}
+	return false
+}
+
+func catalogAllowsArtifact(catalog []Artifact, candidate Artifact) bool {
+	if !catalogAllows(catalog, candidate.Rule.ID) {
+		return false
+	}
+	switch candidate.Rule.ID {
+	case "opencode.config", "claude.mcp", "claude.settings", "antigravity.mcp", "antigravity.hooks", "gemini.settings":
+		for _, source := range catalog {
+			if source.Rule.ID == candidate.Rule.ID && source.Path == candidate.Path {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
 // RecognizeArtifact applies the catalog to one repository path.
 func RecognizeArtifact(filename string, files map[string]string) []Artifact {
 	return catalogMatches(filename, files[filename], files)
