@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -66,6 +67,54 @@ func TestRunExplicitStandardInputScopeForBothProviders(t *testing.T) {
 				t.Fatalf("explicit scope journey leaked or returned success: status=%d output=%q errors=%q", status, output.String(), errors.String())
 			}
 		})
+	}
+}
+
+func TestRunOutputFileOverwritesExistingReportWithoutWritingStdout(t *testing.T) {
+	for _, format := range []string{"terminal", "jsonl"} {
+		t.Run(format, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }))
+			defer server.Close()
+			t.Setenv("GITHUB_TOKEN", "runtime-token")
+			path := filepath.Join(t.TempDir(), "report.txt")
+			if err := os.WriteFile(path, []byte("obsolete report"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			status := run([]string{"-provider", "github", "-base-url", server.URL, "-scope", "team/missing", "-format", format, "-o", path}, strings.NewReader(""), &stdout, &stderr)
+			content, err := os.ReadFile(path)
+			if err != nil || status != 2 || stdout.Len() != 0 || strings.Contains(string(content), "obsolete report") || strings.Contains(string(content)+stderr.String(), "runtime-token") {
+				t.Fatalf("report was not written safely: status=%d stdout=%q stderr=%q err=%v", status, stdout.String(), stderr.String(), err)
+			}
+			if !strings.Contains(stderr.String(), "preparing repository scope") {
+				t.Fatal("progress did not stay on stderr")
+			}
+			if format == "terminal" {
+				if !strings.Contains(string(content), "Scan: incomplete") {
+					t.Fatalf("terminal report missing: %q", content)
+				}
+			} else {
+				var report kopis.Presentation
+				if err := json.Unmarshal(content, &report); err != nil || report.ExitCode != 2 {
+					t.Fatalf("JSONL report invalid: err=%v report=%+v", err, report)
+				}
+			}
+		})
+	}
+}
+
+func TestRunOutputFileFailureDoesNotPrintReportOrReplaceDirectory(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	destination := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	status := run([]string{"-provider", "github", "-base-url", server.URL, "-scope", "team/missing", "-o", destination}, strings.NewReader(""), &stdout, &stderr)
+	if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "output failed") {
+		t.Fatalf("output failure was not reported: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	if info, err := os.Stat(destination); err != nil || !info.IsDir() {
+		t.Fatalf("destination directory was changed: %v %v", info, err)
 	}
 }
 
@@ -129,6 +178,72 @@ func TestRunExplicitScopeSearchesRepositoryOutsideDefaultDiscovery(t *testing.T)
 				}
 			})
 		}
+	}
+}
+
+func TestRunExplainShowsCandidateStagesWithoutSecretContent(t *testing.T) {
+	secret := "synthetic-db-pass-123"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/team/explicit":
+			_, _ = w.Write([]byte(`{"full_name":"team/explicit","default_branch":"main"}`))
+		case "/repos/team/explicit/commits/main":
+			_, _ = w.Write([]byte(`{"sha":"commit-1","commit":{"tree":{"sha":"tree-1"}}}`))
+		case "/repos/team/explicit/git/trees/tree-1":
+			_, _ = w.Write([]byte(`{"tree":[{"path":".claude/settings.json","type":"blob","sha":"blob-1"},{"path":"other.txt","type":"blob","sha":"blob-2"}]}`))
+		case "/repos/team/explicit/git/blobs/blob-1":
+			content := `{"allow":["Bash(PGPASSWORD=\"` + secret + `\" psql:*)"]}`
+			_ = json.NewEncoder(w).Encode(map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(content))})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	var output, errors bytes.Buffer
+	status := run([]string{"-provider", "github", "-base-url", server.URL, "-scope", "team/explicit", "-format", "jsonl", "-explain"}, strings.NewReader(""), &output, &errors)
+	if status != 0 || !strings.Contains(errors.String(), `path=".claude/settings.json" stage=inspected`) || !strings.Contains(errors.String(), "listed=2") || !strings.Contains(output.String(), "claude.settings") || !strings.Contains(output.String(), `"status":"findings"`) {
+		t.Fatalf("safe handoff report missing: status=%d stdout=%q stderr=%q", status, output.String(), errors.String())
+	}
+	if strings.Contains(output.String()+errors.String(), secret) || strings.Contains(output.String()+errors.String(), "runtime-token") {
+		t.Fatal("explain output leaked credential or token")
+	}
+}
+
+func TestRunGitLabListsAndInspectsPinnedDatabaseURL(t *testing.T) {
+	secret := "synthetic-db-pass-456"
+	var fetched int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v4/projects/team/explicit":
+			_, _ = w.Write([]byte(`{"path_with_namespace":"team/explicit","default_branch":"main"}`))
+		case "/api/v4/projects/team/explicit/repository/commits/main":
+			_, _ = w.Write([]byte(`{"id":"commit-1"}`))
+		case "/api/v4/projects/team/explicit/repository/tree":
+			if r.URL.Query().Get("ref") != "commit-1" || r.URL.Query().Get("recursive") != "true" {
+				t.Error("tree was not pinned and recursive")
+			}
+			_, _ = w.Write([]byte(`[{"path":".claude/settings.json","type":"blob"},{"path":"other.txt","type":"blob"}]`))
+		case "/api/v4/projects/team/explicit/repository/files/.claude/settings.json/raw":
+			if r.URL.Query().Get("ref") != "commit-1" {
+				t.Error("file was not pinned")
+			}
+			fetched++
+			_, _ = w.Write([]byte(`{"allow":["Bash(DATABASE_URL=\"postgresql://account:` + secret + `@db.test/app\" psql:*)"]}`))
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITLAB_TOKEN", "runtime-token")
+	var output, errors bytes.Buffer
+	status := run([]string{"-provider", "gitlab", "-base-url", server.URL, "-scope", "team/explicit", "-format", "jsonl", "-explain"}, strings.NewReader(""), &output, &errors)
+	if status != 0 || fetched != 1 || !strings.Contains(output.String(), "claude.settings") || !strings.Contains(errors.String(), `path=".claude/settings.json" stage=inspected`) {
+		t.Fatalf("GitLab tree-to-finding journey failed: status=%d fetches=%d stdout=%q stderr=%q", status, fetched, output.String(), errors.String())
+	}
+	if strings.Contains(output.String()+errors.String(), secret) || strings.Contains(output.String()+errors.String(), "runtime-token") {
+		t.Fatal("GitLab output leaked credential or token")
 	}
 }
 
@@ -466,7 +581,7 @@ func TestRunCompleteAndIncompleteJourneysThroughRuntimeAdapters(t *testing.T) {
 						}
 					}
 					for _, repository := range presentation.Repositories {
-						if repository.Status != kopis.RepositoryNoFindings && repository.Status != kopis.RepositoryPartial && repository.Status != kopis.RepositoryUnscanned {
+						if repository.Status != kopis.RepositoryFindings && repository.Status != kopis.RepositoryPartial && repository.Status != kopis.RepositoryUnscanned {
 							t.Fatalf("unexpected repository status: %+v", repository)
 						}
 					}
@@ -477,7 +592,7 @@ func TestRunCompleteAndIncompleteJourneysThroughRuntimeAdapters(t *testing.T) {
 					}
 				} else {
 					presentation := presentations["jsonl"]
-					for _, marker := range []string{"complete=false", "status=no_findings", "status=partial", "status=unscanned", "pinned-revision"} {
+					for _, marker := range []string{"Scan: incomplete", "status: findings", "status: partial", "status: unscanned", "pinned-revision"} {
 						if !strings.Contains(output.String(), marker) {
 							t.Fatalf("%s/%s terminal output omitted semantic marker %q: %q", provider, scopeMode, marker, output.String())
 						}

@@ -10,7 +10,7 @@ import (
 func presentationResult(status string) ScanResult {
 	return ScanResult{
 		Repositories: []RepositoryResult{{Repository: Repository{Provider: GitHubProvider, ID: "team/repo", URL: "https://user:password@example.test/team/repo"}, Status: status}},
-		Findings:     []Finding{{Provider: GitHubProvider, Repository: "team/repo", Path: "opencode.json", Classification: ClassificationConfirmed, Severity: SeverityHigh, Indicator: "api_key", Location: Location{StartLine: 3}, Guidance: "rotate or revoke"}},
+		Findings:     []Finding{{Provider: GitHubProvider, Repository: "team/repo", Path: "opencode.json", Classification: ClassificationConfirmed, Severity: SeverityHigh, Indicator: "api_key", Location: Location{StartLine: 3, EndLine: 3}, Guidance: "rotate or revoke"}},
 	}
 }
 
@@ -23,7 +23,7 @@ func TestPresentationKeepsTerminalAndJSONLRedactedSemantics(t *testing.T) {
 	if err := WriteJSONL(&jsonl, result); err != nil {
 		t.Fatal(err)
 	}
-	if terminal.String() == "" || !strings.Contains(terminal.String(), "confirmed high") {
+	if terminal.String() == "" || !strings.Contains(terminal.String(), "HIGH confirmed api_key") {
 		t.Fatalf("terminal output omitted finding semantics: %q", terminal.String())
 	}
 	var decoded Presentation
@@ -73,5 +73,56 @@ func TestPresentationFailsClosedForMalformedCredentialURL(t *testing.T) {
 		if strings.Contains(output, "user:") || strings.Contains(output, "%zz") {
 			t.Fatalf("malformed credential URL leaked: %q", output)
 		}
+	}
+}
+
+func TestTerminalGroupsRepeatedFindingsAndKeepsEveryLocation(t *testing.T) {
+	result := ScanResult{
+		Repositories: []RepositoryResult{{Repository: Repository{Provider: GitHubProvider, ID: "team/repo"}, Status: RepositoryFindings, Findings: make([]Finding, 3)}},
+		Findings: []Finding{
+			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", Tool: ToolClaudeCode, CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationConfirmed, Severity: SeverityHigh, Fingerprint: "synthetic-fingerprint", Location: Location{StartLine: 24, StartByte: 420, EndLine: 24, EndByte: 436}, Guidance: "rotate or revoke"},
+			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", Tool: ToolClaudeCode, CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationConfirmed, Severity: SeverityHigh, Fingerprint: "synthetic-fingerprint", Location: Location{StartLine: 15, StartByte: 120, EndLine: 15, EndByte: 136}, Guidance: "rotate or revoke"},
+			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", Tool: ToolClaudeCode, CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationConfirmed, Severity: SeverityHigh, Fingerprint: "synthetic-fingerprint", Location: Location{StartLine: 16, StartByte: 270, EndLine: 16, EndByte: 286}, Guidance: "rotate or revoke"},
+		},
+	}
+	var terminal, jsonl bytes.Buffer
+	if err := WriteTerminal(&terminal, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteJSONL(&jsonl, result); err != nil {
+		t.Fatal(err)
+	}
+	text := terminal.String()
+	if strings.Count(text, "synthetic-fingerprint") != 1 || strings.Count(text, "rotate or revoke") != 1 || !strings.Contains(text, "3 occurrences") || !strings.Contains(text, "status: findings") {
+		t.Fatalf("terminal output did not group repeated findings: %q", text)
+	}
+	for _, location := range []string{"15:120-136", "16:270-286", "24:420-436"} {
+		if !strings.Contains(text, location) {
+			t.Fatalf("missing source location %s in %q", location, text)
+		}
+	}
+	if strings.Index(text, "15:120-136") > strings.Index(text, "24:420-436") {
+		t.Fatalf("locations not ordered: %q", text)
+	}
+	var decoded Presentation
+	if err := json.Unmarshal(jsonl.Bytes(), &decoded); err != nil || len(decoded.Findings) != 3 {
+		t.Fatalf("JSONL lost individual findings: %+v err=%v", decoded, err)
+	}
+}
+
+func TestTerminalKeepsDistinctCredentialsSeparate(t *testing.T) {
+	result := ScanResult{
+		Repositories: []RepositoryResult{{Repository: Repository{Provider: GitHubProvider, ID: "team/repo"}, Status: RepositoryFindings, Findings: make([]Finding, 2)}},
+		Findings: []Finding{
+			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationConfirmed, Severity: SeverityHigh, Fingerprint: "first-fingerprint", Location: Location{StartLine: 2, EndLine: 2}},
+			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationConfirmed, Severity: SeverityHigh, Fingerprint: "second-fingerprint", Location: Location{StartLine: 3, EndLine: 3}},
+		},
+	}
+	var output bytes.Buffer
+	if err := WriteTerminal(&output, result); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(output.String(), "(1 occurrence)") != 2 || !strings.Contains(output.String(), "first-fingerprint") || !strings.Contains(output.String(), "second-fingerprint") {
+		t.Fatalf("distinct credentials were collapsed: %q", output.String())
 	}
 }

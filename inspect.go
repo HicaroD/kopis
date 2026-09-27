@@ -15,6 +15,7 @@ const (
 	SeverityCritical             = "critical"
 	SeverityHigh                 = "high"
 	SeverityMedium               = "medium"
+	confirmedCredentialGuidance  = "Confirmed literal credential exposure. Rotate or revoke it, remove it from repository history where policy permits, and use runtime secret injection."
 )
 
 // Candidate is the provider-neutral handoff from discovery to inspection.
@@ -37,14 +38,16 @@ type Finding struct {
 }
 
 var (
-	assignment   = regexp.MustCompile(`(?im)\b((?:[A-Za-z][A-Za-z0-9_.-]*?)?(?:api[_-]?key|token|secret|password|authorization|auth|client[_-]?secret|openai-api-key)[A-Za-z0-9_.-]*)\s*[=:]\s*(?:"([^"]+)"|'([^']+)'|(\$\{[A-Za-z_][A-Za-z0-9_]*:-[^}]+\})|([^\s"',}\]]+))`)
-	quotedSecret = regexp.MustCompile(`(?i)(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}`)
-	privateKey   = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
-	secretURL    = regexp.MustCompile(`(?i)https?://[^\s"']+:[^\s@"']+@[^\s"']+`)
-	secretFile   = regexp.MustCompile(`(?i)(?:(?:cat|read|open|readFile|fs\.readFileSync)\s+[^\n]*(?:\.env|credentials|secret|token|\.pem)|(?:open|readFile|fs\.readFileSync)\s*\(\s*["'][^"']*(?:\.env|credentials|secret|token|\.pem)[^"']*["']\s*\))`)
-	processArg   = regexp.MustCompile(`(?i)(?:curl|wget|httpie|gh|git|npm|docker)\b[^\n]*(?:--(?:token|password|header|auth)|(?:token|password|authorization)=)`)
-	transfer     = regexp.MustCompile(`(?i)(?:curl|wget|scp|rsync|nc|netcat)\b[^\n]*(?:https?://|--data|--upload-file|-T\s)`)
-	directAuth   = regexp.MustCompile(`(?i)(?:api[_-]?key|token|secret|password|authorization|auth|client[_-]?secret)\s*[=:]\s*["']?$`)
+	assignment        = regexp.MustCompile(`(?im)\b((?:[A-Za-z][A-Za-z0-9_.-]*?)?(?:api[_-]?key|token|secret|password|authorization|auth|client[_-]?secret|openai-api-key)[A-Za-z0-9_.-]*)\s*[=:]\s*(?:"([^"]+)"|'([^']+)'|(\$\{[A-Za-z_][A-Za-z0-9_]*:-[^}]+\})|([^\s"',}\]]+))`)
+	escapedAssignment = regexp.MustCompile(`(?im)\b((?:[A-Za-z][A-Za-z0-9_.-]*?)?(?:api[_-]?key|token|secret|password|authorization|auth|client[_-]?secret)[A-Za-z0-9_.-]*)\s*[=:]\s*\\"([^"\\\r\n]+)\\"`)
+	databaseURL       = regexp.MustCompile(`(?i)\b(?:postgres(?:ql)?|mysql|mariadb|redis|rediss)://[^:\s/@"\\]+:([^@/\s"\\]+)@[^/\s"\\]+`)
+	quotedSecret      = regexp.MustCompile(`(?i)(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}`)
+	privateKey        = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
+	secretURL         = regexp.MustCompile(`(?i)https?://[^\s"']+:[^\s@"']+@[^\s"']+`)
+	secretFile        = regexp.MustCompile(`(?i)(?:(?:cat|read|open|readFile|fs\.readFileSync)\s+[^\n]*(?:\.env|credentials|secret|token|\.pem)|(?:open|readFile|fs\.readFileSync)\s*\(\s*["'][^"']*(?:\.env|credentials|secret|token|\.pem)[^"']*["']\s*\))`)
+	processArg        = regexp.MustCompile(`(?i)(?:curl|wget|httpie|gh|git|npm|docker)\b[^\n]*(?:--(?:token|password|header|auth)|(?:token|password|authorization)=)`)
+	transfer          = regexp.MustCompile(`(?i)(?:curl|wget|scp|rsync|nc|netcat)\b[^\n]*(?:https?://|--data|--upload-file|-T\s)`)
+	directAuth        = regexp.MustCompile(`(?i)(?:api[_-]?key|token|secret|password|authorization|auth|client[_-]?secret)\s*[=:]\s*["']?$`)
 )
 
 // Inspect examines only an already catalogued candidate.
@@ -65,7 +68,26 @@ func Inspect(candidate Candidate) []Finding {
 		if directAuthenticationKey(key) || strings.Contains(key, "private") {
 			severity = SeverityCritical
 		}
-		findings = append(findings, finding(candidate, indicator, classification, severity, value, valueStart, "Confirmed literal credential exposure. Rotate or revoke it, remove it from repository history where policy permits, and use runtime secret injection."))
+		findings = append(findings, finding(candidate, indicator, classification, severity, value, valueStart, confirmedCredentialGuidance))
+	}
+	for _, match := range escapedAssignment.FindAllStringSubmatchIndex(content, -1) {
+		value := content[match[4]:match[5]]
+		if excluded(value) || !literal(value) {
+			continue
+		}
+		key := strings.ToLower(content[match[2]:match[3]])
+		severity := SeverityHigh
+		if directAuthenticationKey(key) {
+			severity = SeverityCritical
+		}
+		findings = append(findings, finding(candidate, indicatorForKey(key), ClassificationConfirmed, severity, value, match[4], confirmedCredentialGuidance))
+	}
+	for _, match := range databaseURL.FindAllStringSubmatchIndex(content, -1) {
+		value := content[match[2]:match[3]]
+		if excluded(value) || !literal(value) {
+			continue
+		}
+		findings = append(findings, finding(candidate, "password", ClassificationConfirmed, SeverityHigh, value, match[2], confirmedCredentialGuidance))
 	}
 	for _, expression := range []*regexp.Regexp{privateKey, quotedSecret, secretURL} {
 		for _, match := range expression.FindAllStringIndex(content, -1) {
@@ -77,7 +99,7 @@ func Inspect(candidate Candidate) []Finding {
 			if expression != privateKey {
 				indicator, severity = "authorization_value", expressionSeverity(content, match[0], expression)
 			}
-			findings = append(findings, finding(candidate, indicator, ClassificationConfirmed, severity, value, match[0], "Confirmed literal credential exposure. Rotate or revoke it, remove it from repository history where policy permits, and use runtime secret injection."))
+			findings = append(findings, finding(candidate, indicator, ClassificationConfirmed, severity, value, match[0], confirmedCredentialGuidance))
 		}
 	}
 	if isExecutableRule(candidate.CatalogRule) {

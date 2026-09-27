@@ -11,6 +11,7 @@ import (
 )
 
 const (
+	RepositoryFindings             = "findings"
 	RepositoryNoFindings           = "no_findings"
 	RepositoryNoCandidateArtifacts = "no_candidate_artifacts"
 	RepositoryPartial              = "partial"
@@ -119,9 +120,21 @@ type ScanRequest struct {
 }
 
 type RepositoryResult struct {
-	Repository Repository
-	Status     string
-	Findings   []Finding
+	Repository  Repository
+	Status      string
+	Findings    []Finding
+	Diagnostics ScanDiagnostics
+}
+
+// ScanDiagnostics records metadata-only handoffs. It never holds file content,
+// request tokens, matched values, or provider error bodies.
+type ScanDiagnostics struct {
+	ListedFiles     int
+	ListingComplete bool
+	MatchedPaths    []string
+	FetchedPaths    []string
+	InspectedPaths  []string
+	FailedPaths     []string
 }
 
 type ScanResult struct {
@@ -316,6 +329,8 @@ func scanRepository(ctx context.Context, request ScanRequest, repository Reposit
 		return result
 	}
 	listing := request.Scanner.ListFiles(ctx, request.Token, repository)
+	result.Diagnostics.ListedFiles = len(listing.Files)
+	result.Diagnostics.ListingComplete = listing.Complete
 	if listing.Denied {
 		result.Status = RepositoryUnscanned
 		return result
@@ -332,6 +347,7 @@ func scanRepository(ctx context.Context, request ScanRequest, repository Reposit
 		}
 	}
 	queue := catalogPathCandidates(contents, request.Catalog)
+	result.Diagnostics.MatchedPaths = append(result.Diagnostics.MatchedPaths, queue...)
 	fetched := make(map[string]bool)
 	successful := make(map[string]bool)
 	deferred := make(map[string][]Artifact)
@@ -344,6 +360,7 @@ func scanRepository(ctx context.Context, request ScanRequest, repository Reposit
 		}
 		inspected[key] = true
 		admitted = true
+		result.Diagnostics.InspectedPaths = appendUniquePath(result.Diagnostics.InspectedPaths, artifact.Path)
 		result.Findings = append(result.Findings, inspectListedFile(request.Provider, repository, files[artifact.Path], artifact, contents[artifact.Path])...)
 	}
 	for len(queue) > 0 {
@@ -360,9 +377,11 @@ func scanRepository(ctx context.Context, request ScanRequest, repository Reposit
 		outcome := request.Scanner.FetchFile(ctx, request.Token, repository, files[file])
 		if !outcome.Complete {
 			incomplete = true
+			result.Diagnostics.FailedPaths = append(result.Diagnostics.FailedPaths, file)
 			continue
 		}
 		successful[file] = true
+		result.Diagnostics.FetchedPaths = append(result.Diagnostics.FetchedPaths, file)
 		contents[file] = outcome.Content
 		artifacts := append(RecognizeArtifact(file, contents), deferred[file]...)
 		for _, artifact := range artifacts {
@@ -376,6 +395,7 @@ func scanRepository(ctx context.Context, request ScanRequest, repository Reposit
 					} else if !fetched[artifact.Path] {
 						deferred[artifact.Path] = append(deferred[artifact.Path], artifact)
 						queue = append(queue, artifact.Path)
+						result.Diagnostics.MatchedPaths = appendUniquePath(result.Diagnostics.MatchedPaths, artifact.Path)
 					}
 				}
 				continue
@@ -385,10 +405,21 @@ func scanRepository(ctx context.Context, request ScanRequest, repository Reposit
 	}
 	if incomplete {
 		result.Status = RepositoryPartial
+	} else if len(result.Findings) > 0 {
+		result.Status = RepositoryFindings
 	} else if admitted {
 		result.Status = RepositoryNoFindings
 	}
 	return result
+}
+
+func appendUniquePath(paths []string, path string) []string {
+	for _, existing := range paths {
+		if existing == path {
+			return paths
+		}
+	}
+	return append(paths, path)
 }
 
 func inspectListedFile(provider string, repository Repository, file RepositoryFile, artifact Artifact, content string) []Finding {

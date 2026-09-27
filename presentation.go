@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"sort"
+	"strings"
 )
 
 // Presentation is the redacted, provider-neutral output contract. It contains
@@ -50,27 +52,116 @@ func Present(result ScanResult) Presentation {
 	return presentation
 }
 
-// WriteTerminal writes concise human-readable output. Sensitive content is
-// intentionally absent; guidance remains available on finding lines.
+// WriteTerminal groups repeated evidence while keeping every source location.
+// Sensitive content is intentionally absent.
 func WriteTerminal(w io.Writer, result ScanResult) error {
 	presentation := Present(result)
-	if _, err := fmt.Fprintf(w, "complete=%t exit_code=%d\n", presentation.Complete, presentation.ExitCode); err != nil {
+	state := "complete"
+	if !presentation.Complete {
+		state = "incomplete"
+	}
+	repositoryLabel, findingLabel := "repositories", "findings"
+	if len(presentation.Repositories) == 1 {
+		repositoryLabel = "repository"
+	}
+	if len(presentation.Findings) == 1 {
+		findingLabel = "finding"
+	}
+	if _, err := fmt.Fprintf(w, "Scan: %s | %d %s | %d %s\n", state, len(presentation.Repositories), repositoryLabel, len(presentation.Findings), findingLabel); err != nil {
 		return err
 	}
 	for _, repository := range presentation.Repositories {
-		if _, err := fmt.Fprintf(w, "%s %s url=%s status=%s findings=%d\n", repository.Provider, repository.Repository, repository.URL, repository.Status, repository.Findings); err != nil {
+		if _, err := fmt.Fprintf(w, "\nRepository: %s/%s\n  status: %s | findings: %d\n", repository.Provider, repository.Repository, repository.Status, repository.Findings); err != nil {
 			return err
 		}
-	}
-	for _, finding := range presentation.Findings {
-		if _, err := fmt.Fprintf(w, "finding provider=%s repository=%s url=%s revision=%s path=%s tool=%s rule=%s location=%d-%d/%d-%d indicator=%s classification=%s severity=%s (%s %s) fingerprint=%s reason=%s\n", finding.Provider, finding.Repository, finding.RepositoryURL, finding.Revision, finding.Path, finding.Tool, finding.CatalogRule, finding.Location.StartLine, finding.Location.StartByte, finding.Location.EndLine, finding.Location.EndByte, finding.Indicator, finding.Classification, finding.Severity, finding.Classification, finding.Severity, finding.Fingerprint, finding.Reason); err != nil {
-			return err
+		if repository.URL != "" {
+			if _, err := fmt.Fprintf(w, "  url: %s\n", repository.URL); err != nil {
+				return err
+			}
 		}
-		if _, err := fmt.Fprintf(w, "guidance: %s\n", finding.Guidance); err != nil {
-			return err
+		for _, group := range groupsForRepository(presentation.Findings, repository) {
+			count := "occurrence"
+			if len(group.locations) != 1 {
+				count = "occurrences"
+			}
+			if _, err := fmt.Fprintf(w, "\n  %s\n    %s %s %s (%d %s)\n", group.key.path, strings.ToUpper(group.key.severity), group.key.classification, group.key.indicator, len(group.locations), count); err != nil {
+				return err
+			}
+			if group.key.rule != "" || group.key.tool != "" {
+				if _, err := fmt.Fprintf(w, "    rule: %s | tool: %s\n", group.key.rule, group.key.tool); err != nil {
+					return err
+				}
+			}
+			for _, detail := range []struct{ label, value string }{{"revision", group.key.revision}, {"fingerprint", group.key.fingerprint}, {"reason", group.key.reason}} {
+				if detail.value != "" {
+					if _, err := fmt.Fprintf(w, "    %s: %s\n", detail.label, detail.value); err != nil {
+						return err
+					}
+				}
+			}
+			if _, err := fmt.Fprintln(w, "    locations:"); err != nil {
+				return err
+			}
+			for _, location := range group.locations {
+				line := fmt.Sprintf("L%d", location.StartLine)
+				if location.EndLine != location.StartLine {
+					line += fmt.Sprintf("-L%d", location.EndLine)
+				}
+				if _, err := fmt.Fprintf(w, "      - %s:%d-%d\n", line, location.StartByte, location.EndByte); err != nil {
+					return err
+				}
+			}
+			if group.key.guidance != "" {
+				if _, err := fmt.Fprintf(w, "    guidance: %s\n", group.key.guidance); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
+}
+
+type terminalGroupKey struct {
+	path, tool, rule, revision, indicator, classification, severity, fingerprint, reason, guidance string
+}
+
+type terminalGroup struct {
+	key       terminalGroupKey
+	locations []Location
+}
+
+func groupsForRepository(findings []Finding, repository PresentedRepository) []terminalGroup {
+	indexes := make(map[terminalGroupKey]int)
+	var groups []terminalGroup
+	for _, finding := range findings {
+		if finding.Provider != repository.Provider || finding.Repository != repository.Repository {
+			continue
+		}
+		key := terminalGroupKey{finding.Path, finding.Tool, finding.CatalogRule, finding.Revision, finding.Indicator, finding.Classification, finding.Severity, finding.Fingerprint, finding.Reason, finding.Guidance}
+		index, exists := indexes[key]
+		if !exists {
+			index = len(groups)
+			indexes[key] = index
+			groups = append(groups, terminalGroup{key: key})
+		}
+		groups[index].locations = append(groups[index].locations, finding.Location)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].key.path != groups[j].key.path {
+			return groups[i].key.path < groups[j].key.path
+		}
+		return groups[i].key.indicator < groups[j].key.indicator
+	})
+	for i := range groups {
+		sort.Slice(groups[i].locations, func(a, b int) bool {
+			left, right := groups[i].locations[a], groups[i].locations[b]
+			if left.StartLine != right.StartLine {
+				return left.StartLine < right.StartLine
+			}
+			return left.StartByte < right.StartByte
+		})
+	}
+	return groups
 }
 
 // WriteJSONL writes one JSON Lines record containing the same semantic data as

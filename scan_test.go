@@ -70,7 +70,7 @@ func TestScanListsPathsAndFetchesOnlyCatalogCandidates(t *testing.T) {
 			{Path: "notes.txt", Revision: "blob-2"},
 		}}, contents: map[string]string{".opencode/plugins/custom.ts": "api_key=literal-secret"}}
 	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "runtime-token", Scanner: provider, Catalog: InitialCatalog()})
-	if err != nil || len(result.Findings) != 1 || result.Findings[0].CatalogRule != "opencode.plugin" || result.Repositories[0].Status != RepositoryNoFindings {
+	if err != nil || len(result.Findings) != 1 || result.Findings[0].CatalogRule != "opencode.plugin" || result.Repositories[0].Status != RepositoryFindings {
 		t.Fatalf("listing-based scan missed directory candidate: result=%+v err=%v", result, err)
 	}
 	if len(provider.searches) != 0 || len(provider.fetched) != 1 || provider.fetched[0] != ".opencode/plugins/custom.ts" {
@@ -141,6 +141,43 @@ func TestScanSubstitutionStillAppliesWhenTargetWasFetchedFirst(t *testing.T) {
 	}
 }
 
+func TestScanDiagnosticsExplainCandidateHandoffWithoutContent(t *testing.T) {
+	provider := &scanProvider{repositories: []Repository{{Provider: GitHubProvider, ID: "team/repo", Owner: true, Accessible: true}},
+		listing:  FileListing{Complete: true, Files: []RepositoryFile{{Path: ".claude/settings.json", Revision: "blob"}, {Path: "other.txt", Revision: "ignored"}}},
+		contents: map[string]string{".claude/settings.json": `{"allow":["Bash(PGPASSWORD=\"synthetic-db-pass-123\" psql:*)"]}`}}
+	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "token", Scanner: provider, Catalog: InitialCatalog()})
+	if err != nil || len(result.Repositories) != 1 {
+		t.Fatalf("scan failed: %+v %v", result, err)
+	}
+	diagnostic := result.Repositories[0].Diagnostics
+	if diagnostic.ListedFiles != 2 || !diagnostic.ListingComplete || len(diagnostic.MatchedPaths) != 1 || diagnostic.MatchedPaths[0] != ".claude/settings.json" || len(diagnostic.FetchedPaths) != 1 || len(diagnostic.InspectedPaths) != 1 {
+		t.Fatalf("candidate handoff not observable: %+v", diagnostic)
+	}
+	if strings.Contains(strings.Join(diagnostic.MatchedPaths, " ")+strings.Join(diagnostic.FetchedPaths, " ")+strings.Join(diagnostic.InspectedPaths, " "), "synthetic-db-pass-123") {
+		t.Fatal("diagnostics included credential content")
+	}
+}
+
+func TestScanRepositoryWithFindingsDoesNotReportNoFindings(t *testing.T) {
+	provider := &scanProvider{repositories: []Repository{{Provider: GitHubProvider, ID: "team/repo", Owner: true, Accessible: true}},
+		listing:  FileListing{Complete: true, Files: []RepositoryFile{{Path: ".claude/settings.json", Revision: "blob"}}},
+		contents: map[string]string{".claude/settings.json": `{"allow":["Bash(PGPASSWORD=\"synthetic-db-pass-123\" psql:*)"]}`}}
+	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "token", Scanner: provider, Catalog: InitialCatalog()})
+	if err != nil || len(result.Findings) != 1 || result.Repositories[0].Status != RepositoryFindings {
+		t.Fatalf("finding was disguised as no_findings: result=%+v err=%v", result, err)
+	}
+}
+
+func TestScanCleanCatalogCandidateReportsNoFindings(t *testing.T) {
+	provider := &scanProvider{repositories: []Repository{{Provider: GitHubProvider, ID: "team/repo", Owner: true, Accessible: true}},
+		listing:  FileListing{Complete: true, Files: []RepositoryFile{{Path: ".claude/settings.json", Revision: "blob"}}},
+		contents: map[string]string{".claude/settings.json": `{"permissions":{"allow":["Bash(ls:*)"]}}`}}
+	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "token", Scanner: provider, Catalog: InitialCatalog()})
+	if err != nil || result.Repositories[0].Status != RepositoryNoFindings || len(result.Findings) != 0 {
+		t.Fatalf("clean catalog candidate did not report no_findings: result=%+v err=%v", result, err)
+	}
+}
+
 func TestScanFiltersDeduplicatesAndComposesRepositoryStatuses(t *testing.T) {
 	provider := &scanProvider{listings: map[string]FileListing{
 		"owner/complete": {Complete: true, Files: []RepositoryFile{{Path: "opencode.json", Revision: "rev"}}},
@@ -156,7 +193,7 @@ func TestScanFiltersDeduplicatesAndComposesRepositoryStatuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Repositories) != 2 || result.Repositories[0].Status != RepositoryPartial || result.Repositories[1].Status != RepositoryNoFindings {
+	if len(result.Repositories) != 2 || result.Repositories[0].Status != RepositoryPartial || result.Repositories[1].Status != RepositoryFindings {
 		t.Fatalf("unexpected repository statuses: %+v", result.Repositories)
 	}
 	if len(result.Findings) != 1 || result.Findings[0].Fingerprint == "" || strings.Contains(result.Findings[0].Guidance, "literal-secret") {

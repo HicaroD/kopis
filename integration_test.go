@@ -57,7 +57,7 @@ func TestDeterministicProviderJourneysReachRedactedOutputs(t *testing.T) {
 			for _, repository := range result.Repositories {
 				statuses[repository.Status] = true
 			}
-			for _, status := range []string{RepositoryNoFindings, RepositoryPartial, RepositoryUnscanned} {
+			for _, status := range []string{RepositoryFindings, RepositoryPartial, RepositoryUnscanned} {
 				if !statuses[status] {
 					t.Fatalf("missing status %q: %+v", status, statuses)
 				}
@@ -151,5 +151,32 @@ func TestInspectionCredentialURLIsHighUnlessDirectField(t *testing.T) {
 	findings := Inspect(Candidate{Path: "settings.json", CatalogRule: "claude.settings", Content: `url="https://user:password@safe.test/path"`})
 	if len(findings) != 1 || findings[0].Indicator != "authorization_value" || findings[0].Severity != SeverityHigh {
 		t.Fatalf("credential-bearing URL was over-promoted: %+v", findings)
+	}
+}
+
+func TestInspectionFindsJSONEscapedShellPasswordWithoutExposingIt(t *testing.T) {
+	content := `{"permissions":{"allow":["Bash(PGPASSWORD=\"synthetic-db-pass-123\" psql:*)"]}}`
+	findings := Inspect(Candidate{Path: ".claude/settings.json", CatalogRule: "claude.settings", Content: content})
+	if len(findings) != 1 || findings[0].Indicator != "password" || findings[0].Classification != ClassificationConfirmed {
+		t.Fatalf("escaped shell assignment not recognized: count=%d", len(findings))
+	}
+	finding := findings[0]
+	if content[finding.Location.StartByte:finding.Location.EndByte] != "synthetic-db-pass-123" || finding.Fingerprint != fingerprint("synthetic-db-pass-123") {
+		t.Fatal("escaped assignment has an incorrect source location or fingerprint")
+	}
+	encoded, err := json.Marshal(findings)
+	if err != nil || strings.Contains(string(encoded), "synthetic-db-pass-123") {
+		t.Fatal("credential leaked into finding output")
+	}
+}
+
+func TestInspectionFindsDatabaseURLPasswordAndRejectsPlaceholders(t *testing.T) {
+	content := `{"allow":["Bash(DATABASE_URL=\"postgresql://account:synthetic-db-pass-456@db.test:5432/app\" psql:*)", "Bash(DATABASE_URL=\"postgresql://account:${DB_PASSWORD}@db.test/app\" psql:*)"]}`
+	findings := Inspect(Candidate{Path: ".claude/settings.json", CatalogRule: "claude.settings", Content: content})
+	if len(findings) != 1 || findings[0].Indicator != "password" || findings[0].Severity != SeverityHigh {
+		t.Fatalf("database URL password not distinguished from placeholder: count=%d", len(findings))
+	}
+	if content[findings[0].Location.StartByte:findings[0].Location.EndByte] != "synthetic-db-pass-456" || findings[0].Fingerprint != fingerprint("synthetic-db-pass-456") {
+		t.Fatal("database URL password has an incorrect source location or fingerprint")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -192,7 +193,13 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	scope := flags.String("scope", "", "comma-separated repository IDs; omit for authorized default scope")
 	scopeFile := flags.String("scope-file", "", "file containing one repository ID per line, or - for standard input")
 	format := flags.String("format", "terminal", "output format: terminal or jsonl")
+	outputPath := flags.String("o", "", "write the report to this file (overwrites an existing report)")
+	explain := flags.Bool("explain", false, "report catalog path handoffs on standard error without file content")
 	if err := flags.Parse(args); err != nil {
+		return 1
+	}
+	if *format != "terminal" && *format != "jsonl" {
+		fmt.Fprintln(stderr, "kopis: format must be terminal or jsonl")
 		return 1
 	}
 	if *providerName != kopis.GitHubProvider && *providerName != kopis.GitLabProvider {
@@ -269,19 +276,55 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		fmt.Fprintln(stderr, "kopis:", err)
 		return 1
 	}
-	if *format == "terminal" {
-		err = kopis.WriteTerminal(stdout, result)
-	} else if *format == "jsonl" {
-		err = kopis.WriteJSONL(stdout, result)
+	if *explain {
+		for _, repository := range result.Repositories {
+			d := repository.Diagnostics
+			fmt.Fprintf(stderr, "kopis: repository=%q status=%s listed=%d listing_complete=%t matched=%d fetched=%d inspected=%d failed=%d\n", repository.Repository.ID, repository.Status, d.ListedFiles, d.ListingComplete, len(d.MatchedPaths), len(d.FetchedPaths), len(d.InspectedPaths), len(d.FailedPaths))
+			for _, stage := range []struct {
+				name  string
+				paths []string
+			}{
+				{"matched", d.MatchedPaths}, {"fetched", d.FetchedPaths}, {"inspected", d.InspectedPaths}, {"failed", d.FailedPaths},
+			} {
+				for _, path := range stage.paths {
+					fmt.Fprintf(stderr, "kopis: repository=%q path=%q stage=%s\n", repository.Repository.ID, path, stage.name)
+				}
+			}
+		}
+	}
+	if *outputPath == "" {
+		err = writeReport(stdout, *format, result)
 	} else {
-		fmt.Fprintln(stderr, "kopis: format must be terminal or jsonl")
-		return 1
+		err = writeReportFile(*outputPath, *format, result)
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "kopis: output failed")
 		return 1
 	}
 	return kopis.ExitCode(result)
+}
+
+func writeReport(w io.Writer, format string, result kopis.ScanResult) error {
+	if format == "jsonl" {
+		return kopis.WriteJSONL(w, result)
+	}
+	return kopis.WriteTerminal(w, result)
+}
+
+func writeReportFile(path, format string, result kopis.ScanResult) error {
+	file, err := os.CreateTemp(filepath.Dir(path), ".kopis-report-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if err := writeReport(file, format, result); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), path)
 }
 
 func commaScope(value string) kopis.Scope {
