@@ -180,3 +180,23 @@ func TestInspectionFindsDatabaseURLPasswordAndRejectsPlaceholders(t *testing.T) 
 		t.Fatal("database URL password has an incorrect source location or fingerprint")
 	}
 }
+
+func TestInspectionDoesNotTreatCaptionTokensAsAccessTokens(t *testing.T) {
+	content := "const SWITCH_CAPTIONS_EVERY_MS = 1200;\n" +
+		"createTikTokStyleCaptions({ captions, combineTokensWithinMilliseconds: SWITCH_CAPTIONS_EVERY_MS });\n" +
+		"const isActive = token.fromMs <= absoluteTimeMs && token.toMs > absoluteTimeMs;"
+	findings := Inspect(Candidate{Path: ".gemini/skills/remotion-best-practices/rules/display-captions.md", CatalogRule: "gemini.skills", Content: content})
+	if len(findings) != 0 {
+		t.Fatalf("caption timing misclassified as a credential: %+v", findings)
+	}
+}
+
+func TestInspectionDistinguishesEnvironmentReferenceFromLiteralAccessToken(t *testing.T) {
+	content := "const accessToken = process.env.MAPS_ACCESS_TOKEN;\n" +
+		"const otherToken = import.meta.env.VITE_API_TOKEN;\n" +
+		"const accessToken = 'synthetic-literal-token-123';"
+	findings := Inspect(Candidate{Path: ".gemini/skills/remotion-best-practices/rules/maps.md", CatalogRule: "gemini.skills", Content: content})
+	if len(findings) != 1 || findings[0].Fingerprint != fingerprint("synthetic-literal-token-123") || findings[0].Indicator != "access_token" {
+		t.Fatalf("environment reference reported or literal token missed: %+v", findings)
+	}
+}

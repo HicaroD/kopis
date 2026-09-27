@@ -58,10 +58,11 @@ func Inspect(candidate Candidate) []Finding {
 		valueStart, valueEnd := assignmentValue(match)
 		value := content[valueStart:valueEnd]
 		value, valueStart = literalAssignmentValue(value, valueStart)
-		if excluded(value) || !literal(value) {
+		keyName := content[match[2]:match[3]]
+		if !credentialAssignmentKey(keyName) || excluded(value) || !literal(value) {
 			continue
 		}
-		key := strings.ToLower(content[match[2]:match[3]])
+		key := strings.ToLower(keyName)
 		indicator := indicatorForKey(key)
 		classification := ClassificationConfirmed
 		severity := SeverityHigh
@@ -72,10 +73,11 @@ func Inspect(candidate Candidate) []Finding {
 	}
 	for _, match := range escapedAssignment.FindAllStringSubmatchIndex(content, -1) {
 		value := content[match[4]:match[5]]
-		if excluded(value) || !literal(value) {
+		keyName := content[match[2]:match[3]]
+		if !credentialAssignmentKey(keyName) || excluded(value) || !literal(value) {
 			continue
 		}
-		key := strings.ToLower(content[match[2]:match[3]])
+		key := strings.ToLower(keyName)
 		severity := SeverityHigh
 		if directAuthenticationKey(key) {
 			severity = SeverityCritical
@@ -204,9 +206,27 @@ func literalAssignmentValue(value string, start int) (string, int) {
 func directAuthenticationKey(key string) bool {
 	return strings.Contains(key, "api") || strings.Contains(key, "authorization") || strings.Contains(key, "auth") || strings.Contains(key, "token") || strings.Contains(key, "clientsecret") || strings.Contains(key, "client_secret")
 }
+func credentialAssignmentKey(key string) bool {
+	lower := strings.ToLower(key)
+	if strings.Contains(lower, "api_key") || strings.Contains(lower, "api-key") || strings.Contains(lower, "apikey") || strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "authorization") || strings.Contains(lower, "auth") {
+		return true
+	}
+	for start := 0; start < len(lower); {
+		i := strings.Index(lower[start:], "token")
+		if i < 0 {
+			return false
+		}
+		end := start + i + len("token")
+		if end == len(key) || strings.ContainsRune("_.-", rune(key[end])) || key[end] >= 'A' && key[end] <= 'Z' {
+			return true
+		}
+		start = end
+	}
+	return false
+}
 func excluded(value string) bool {
 	lower := strings.ToLower(value)
-	return strings.Contains(lower, "example") || strings.Contains(lower, "placeholder") || strings.Contains(lower, "redacted") || strings.Contains(lower, "xxxxx") || strings.Contains(lower, "your_") || strings.Contains(lower, "your-") || strings.Contains(lower, "<token>")
+	return strings.HasPrefix(value, "process.env.") || strings.HasPrefix(value, "import.meta.env.") || strings.Contains(lower, "example") || strings.Contains(lower, "placeholder") || strings.Contains(lower, "redacted") || strings.Contains(lower, "xxxxx") || strings.Contains(lower, "your_") || strings.Contains(lower, "your-") || strings.Contains(lower, "<token>")
 }
 func reasonFor(classification string) string {
 	if classification == ClassificationReviewRequired {
