@@ -11,12 +11,12 @@ import (
 )
 
 const (
-	ClassificationConfirmed      = "confirmed"
-	ClassificationReviewRequired = "review_required"
-	SeverityCritical             = "critical"
-	SeverityHigh                 = "high"
-	SeverityMedium               = "medium"
-	confirmedCredentialGuidance  = "Confirmed literal credential exposure. Rotate or revoke it, remove it from repository history where policy permits, and use runtime secret injection."
+	ClassificationLiteralCandidate = "literal_candidate"
+	ClassificationReviewRequired   = "review_required"
+	SeverityCritical               = "critical"
+	SeverityHigh                   = "high"
+	SeverityMedium                 = "medium"
+	literalCandidateGuidance       = "Review this literal value in context. If it is a real credential, rotate or revoke it and remove it from repository history where policy permits."
 )
 
 // Candidate is the provider-neutral handoff from discovery to inspection.
@@ -32,6 +32,7 @@ type Location struct{ StartLine, StartByte, EndLine, EndByte int }
 type Finding struct {
 	Provider, Repository, RepositoryURL, Revision, Path    string
 	Tool, CatalogRule, Indicator, Classification, Severity string
+	RelatedRules                                           []string
 	Fingerprint                                            string
 	Location                                               Location
 	Guidance                                               string
@@ -44,7 +45,7 @@ var (
 	databaseURL       = regexp.MustCompile(`(?i)\b(?:postgres(?:ql)?|mysql|mariadb|redis|rediss)://[^:\s/@"\\]+:([^@/\s"\\]+)@[^/\s"\\]+`)
 	quotedSecret      = regexp.MustCompile(`(?i)(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}`)
 	privateKey        = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
-	secretURL         = regexp.MustCompile(`(?i)https?://[^\s"']+:[^\s@"']+@[^\s"']+`)
+	secretURL         = regexp.MustCompile(`(?i)https?://[^\s/:@"'\\]+:[^\s/@"'\\]+@[^\s/"'\\]+(?:/[^\s"'\\]*)?`)
 	secretFile        = regexp.MustCompile(`(?i)(?:(?:cat|read|open|readFile|fs\.readFileSync)\s+[^\n]*(?:\.env|credentials|secret|token|\.pem)|(?:open|readFile|fs\.readFileSync)\s*\(\s*["'][^"']*(?:\.env|credentials|secret|token|\.pem)[^"']*["']\s*\))`)
 	processArg        = regexp.MustCompile(`(?i)(?:curl|wget|httpie|gh|git|npm|docker)\b[^\n]*(?:--(?:token|password|header|auth)|(?:token|password|authorization)=)`)
 	transfer          = regexp.MustCompile(`(?i)(?:curl|wget|scp|rsync|nc|netcat)\b[^\n]*(?:https?://|--data|--upload-file|-T\s)`)
@@ -78,17 +79,18 @@ func Inspect(candidate Candidate) []Finding {
 			value := content[valueStart:valueEnd]
 			value, valueStart = literalAssignmentValue(value, valueStart)
 			keyName := content[match[2]:match[3]]
-			if !credentialAssignmentKey(keyName) || excluded(value) || !literal(value) {
+			if !credentialAssignmentKey(keyName) || excluded(value) || !literal(value) ||
+				hasExtension(strings.ToLower(candidate.Path), ".js", ".jsx", ".ts", ".tsx") && strings.HasPrefix(value, "/") {
 				continue
 			}
 			key := strings.ToLower(keyName)
 			indicator := indicatorForKey(key)
-			classification := ClassificationConfirmed
+			classification := ClassificationLiteralCandidate
 			severity := SeverityHigh
 			if directAuthenticationKey(key) || strings.Contains(key, "private") {
 				severity = SeverityCritical
 			}
-			findings = append(findings, finding(candidate, indicator, classification, severity, value, valueStart, confirmedCredentialGuidance))
+			findings = append(findings, finding(candidate, indicator, classification, severity, value, valueStart, literalCandidateGuidance))
 		}
 	}
 	if !structured {
@@ -103,14 +105,14 @@ func Inspect(candidate Candidate) []Finding {
 			if directAuthenticationKey(key) {
 				severity = SeverityCritical
 			}
-			findings = append(findings, finding(candidate, indicatorForKey(key), ClassificationConfirmed, severity, value, match[4], confirmedCredentialGuidance))
+			findings = append(findings, finding(candidate, indicatorForKey(key), ClassificationLiteralCandidate, severity, value, match[4], literalCandidateGuidance))
 		}
 		for _, match := range databaseURL.FindAllStringSubmatchIndex(content, -1) {
 			value := content[match[2]:match[3]]
 			if excluded(value) || !literal(value) || localCredentialURL(content[match[0]:match[1]]) {
 				continue
 			}
-			findings = append(findings, finding(candidate, "password", ClassificationConfirmed, SeverityHigh, value, match[2], confirmedCredentialGuidance))
+			findings = append(findings, finding(candidate, "password", ClassificationLiteralCandidate, SeverityHigh, value, match[2], literalCandidateGuidance))
 		}
 	}
 	if !structured {
@@ -124,7 +126,7 @@ func Inspect(candidate Candidate) []Finding {
 				if expression != privateKey {
 					indicator, severity = "authorization_value", expressionSeverity(content, match[0], expression)
 				}
-				findings = append(findings, finding(candidate, indicator, ClassificationConfirmed, severity, value, match[0], confirmedCredentialGuidance))
+				findings = append(findings, finding(candidate, indicator, ClassificationLiteralCandidate, severity, value, match[0], literalCandidateGuidance))
 			}
 		}
 	}
@@ -194,7 +196,7 @@ func inspectEmbeddedCommand(candidate Candidate, source string, offset int) []Fi
 			if directAuthenticationKey(strings.ToLower(key)) {
 				severity = SeverityCritical
 			}
-			findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationConfirmed, severity, value, offset+match[4], confirmedCredentialGuidance))
+			findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationLiteralCandidate, severity, value, offset+match[4], literalCandidateGuidance))
 		}
 	}
 	for _, match := range assignment.FindAllStringSubmatchIndex(source, -1) {
@@ -203,13 +205,13 @@ func inspectEmbeddedCommand(candidate Candidate, source string, offset int) []Fi
 		value, valueStart = literalAssignmentValue(value, valueStart)
 		key := source[match[2]:match[3]]
 		if credentialAssignmentKey(key) && literal(value) && !excluded(value) {
-			findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationConfirmed, SeverityHigh, value, offset+valueStart, confirmedCredentialGuidance))
+			findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationLiteralCandidate, SeverityHigh, value, offset+valueStart, literalCandidateGuidance))
 		}
 	}
 	for _, match := range databaseURL.FindAllStringSubmatchIndex(source, -1) {
 		value := source[match[2]:match[3]]
 		if literal(value) && !excluded(value) && !localCredentialURL(source[match[0]:match[1]]) {
-			findings = append(findings, finding(candidate, "password", ClassificationConfirmed, SeverityHigh, value, offset+match[2], confirmedCredentialGuidance))
+			findings = append(findings, finding(candidate, "password", ClassificationLiteralCandidate, SeverityHigh, value, offset+match[2], literalCandidateGuidance))
 		}
 	}
 	return findings
@@ -247,14 +249,17 @@ func expressionSeverity(content string, start int, expression *regexp.Regexp) st
 func InspectCandidate(candidate Candidate) []Finding { return Inspect(candidate) }
 
 func uniqueFindings(findings []Finding) []Finding {
-	seen := make(map[string]bool, len(findings))
+	seen := make(map[string]int, len(findings))
 	result := make([]Finding, 0, len(findings))
 	for _, finding := range findings {
 		key := finding.Path + ":" + strconv.Itoa(finding.Location.StartByte) + ":" + strconv.Itoa(finding.Location.EndByte)
-		if seen[key] {
+		if index, exists := seen[key]; exists {
+			if finding.CatalogRule != result[index].CatalogRule {
+				result[index].RelatedRules = appendUniquePath(result[index].RelatedRules, finding.CatalogRule)
+			}
 			continue
 		}
-		seen[key] = true
+		seen[key] = len(result)
 		result = append(result, finding)
 	}
 	return result
@@ -266,7 +271,7 @@ func finding(c Candidate, indicator, classification, severity, value string, off
 
 func findingAt(c Candidate, indicator, classification, severity, value string, start, end int, guidance string) Finding {
 	fingerprintValue := ""
-	if classification == ClassificationConfirmed {
+	if classification == ClassificationLiteralCandidate {
 		fingerprintValue = fingerprint(value)
 	}
 	return Finding{Provider: c.Provider, Repository: c.Repository, RepositoryURL: safeURL(c.RepositoryURL), Revision: c.Revision, Path: c.Path, Tool: c.Tool, CatalogRule: c.CatalogRule, Indicator: indicator, Classification: classification, Severity: severity, Fingerprint: fingerprintValue, Location: location(c.Content, start, end), Guidance: guidance, Reason: reasonFor(classification)}
@@ -360,13 +365,14 @@ func excluded(value string) bool {
 	lower := strings.ToLower(value)
 	return opencodeEnvRef.MatchString(value) || strings.HasPrefix(value, "process.env.") || strings.HasPrefix(value, "import.meta.env.") ||
 		lower == "example" || lower == "placeholder" || lower == "redacted" || lower == "xxxxx" || lower == "<token>" ||
-		strings.HasPrefix(lower, "your_") || strings.HasPrefix(lower, "your-")
+		strings.HasPrefix(lower, "your_") || strings.HasPrefix(lower, "your-") ||
+		(strings.HasPrefix(lower, "<your_") || strings.HasPrefix(lower, "<your-")) && strings.HasSuffix(lower, ">")
 }
 func reasonFor(classification string) string {
 	if classification == ClassificationReviewRequired {
 		return "suspicious execution behavior without established literal credential exposure"
 	}
-	return "literal credential in a catalogued inspection boundary"
+	return "literal value in a credential-shaped context; exposure not verified"
 }
 func safeURL(raw string) string {
 	parsed, err := url.Parse(raw)

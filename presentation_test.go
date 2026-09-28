@@ -10,7 +10,7 @@ import (
 func presentationResult(status string) ScanResult {
 	return ScanResult{
 		Repositories: []RepositoryResult{{Repository: Repository{Provider: GitHubProvider, ID: "team/repo", URL: "https://user:password@example.test/team/repo"}, Status: status}},
-		Findings:     []Finding{{Provider: GitHubProvider, Repository: "team/repo", Path: "opencode.json", Classification: ClassificationConfirmed, Severity: SeverityHigh, Indicator: "api_key", Location: Location{StartLine: 3, EndLine: 3}, Guidance: "rotate or revoke"}},
+		Findings:     []Finding{{Provider: GitHubProvider, Repository: "team/repo", Path: "opencode.json", Classification: ClassificationLiteralCandidate, Severity: SeverityHigh, Indicator: "api_key", Location: Location{StartLine: 3, EndLine: 3}, Guidance: "rotate or revoke"}},
 	}
 }
 
@@ -23,14 +23,14 @@ func TestPresentationKeepsTerminalAndJSONLRedactedSemantics(t *testing.T) {
 	if err := WriteJSONL(&jsonl, result); err != nil {
 		t.Fatal(err)
 	}
-	if terminal.String() == "" || !strings.Contains(terminal.String(), "HIGH confirmed api_key") {
+	if terminal.String() == "" || !strings.Contains(terminal.String(), "HIGH literal_candidate api_key") {
 		t.Fatalf("terminal output omitted finding semantics: %q", terminal.String())
 	}
 	var decoded Presentation
 	if err := json.Unmarshal([]byte(strings.TrimSpace(jsonl.String())), &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded.Findings) != 1 || decoded.Findings[0].Severity != SeverityHigh || decoded.Findings[0].Classification != ClassificationConfirmed || decoded.ExitCode != 0 {
+	if len(decoded.Findings) != 1 || decoded.Findings[0].Severity != SeverityHigh || decoded.Findings[0].Classification != ClassificationLiteralCandidate || decoded.ExitCode != 0 {
 		t.Fatalf("JSONL semantics differ: %+v", decoded)
 	}
 	for _, output := range []string{terminal.String(), jsonl.String()} {
@@ -80,9 +80,9 @@ func TestTerminalGroupsRepeatedFindingsAndKeepsEveryLocation(t *testing.T) {
 	result := ScanResult{
 		Repositories: []RepositoryResult{{Repository: Repository{Provider: GitHubProvider, ID: "team/repo"}, Status: RepositoryFindings, Findings: make([]Finding, 3)}},
 		Findings: []Finding{
-			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", Tool: ToolClaudeCode, CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationConfirmed, Severity: SeverityHigh, Fingerprint: "synthetic-fingerprint", Location: Location{StartLine: 24, StartByte: 420, EndLine: 24, EndByte: 436}, Guidance: "rotate or revoke"},
-			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", Tool: ToolClaudeCode, CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationConfirmed, Severity: SeverityHigh, Fingerprint: "synthetic-fingerprint", Location: Location{StartLine: 15, StartByte: 120, EndLine: 15, EndByte: 136}, Guidance: "rotate or revoke"},
-			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", Tool: ToolClaudeCode, CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationConfirmed, Severity: SeverityHigh, Fingerprint: "synthetic-fingerprint", Location: Location{StartLine: 16, StartByte: 270, EndLine: 16, EndByte: 286}, Guidance: "rotate or revoke"},
+			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", Tool: ToolClaudeCode, CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationLiteralCandidate, Severity: SeverityHigh, Fingerprint: "synthetic-fingerprint", Location: Location{StartLine: 24, StartByte: 420, EndLine: 24, EndByte: 436}, Guidance: "rotate or revoke"},
+			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", Tool: ToolClaudeCode, CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationLiteralCandidate, Severity: SeverityHigh, Fingerprint: "synthetic-fingerprint", Location: Location{StartLine: 15, StartByte: 120, EndLine: 15, EndByte: 136}, Guidance: "rotate or revoke"},
+			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", Tool: ToolClaudeCode, CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationLiteralCandidate, Severity: SeverityHigh, Fingerprint: "synthetic-fingerprint", Location: Location{StartLine: 16, StartByte: 270, EndLine: 16, EndByte: 286}, Guidance: "rotate or revoke"},
 		},
 	}
 	var terminal, jsonl bytes.Buffer
@@ -114,8 +114,8 @@ func TestTerminalKeepsDistinctCredentialsSeparate(t *testing.T) {
 	result := ScanResult{
 		Repositories: []RepositoryResult{{Repository: Repository{Provider: GitHubProvider, ID: "team/repo"}, Status: RepositoryFindings, Findings: make([]Finding, 2)}},
 		Findings: []Finding{
-			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationConfirmed, Severity: SeverityHigh, Fingerprint: "first-fingerprint", Location: Location{StartLine: 2, EndLine: 2}},
-			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationConfirmed, Severity: SeverityHigh, Fingerprint: "second-fingerprint", Location: Location{StartLine: 3, EndLine: 3}},
+			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationLiteralCandidate, Severity: SeverityHigh, Fingerprint: "first-fingerprint", Location: Location{StartLine: 2, EndLine: 2}},
+			{Provider: GitHubProvider, Repository: "team/repo", Path: ".claude/settings.json", CatalogRule: "claude.settings", Indicator: "password", Classification: ClassificationLiteralCandidate, Severity: SeverityHigh, Fingerprint: "second-fingerprint", Location: Location{StartLine: 3, EndLine: 3}},
 		},
 	}
 	var output bytes.Buffer

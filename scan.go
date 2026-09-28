@@ -448,6 +448,7 @@ func scanRepository(ctx context.Context, request ScanRequest, repository Reposit
 			inspect(artifact)
 		}
 	}
+	result.Findings = uniqueFindings(result.Findings)
 	if incomplete {
 		result.Status = RepositoryPartial
 	} else if len(result.Findings) > 0 {

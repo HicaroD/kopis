@@ -95,8 +95,8 @@ func TestScanNeverFetchesMarkdownIncludingFileSubstitutions(t *testing.T) {
 			".agents/skills/demo/scripts/check.ts": "const apiKey = 'synthetic-script-key-123';",
 		}}
 	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "token", Scanner: provider, Catalog: InitialCatalog()})
-	if err != nil || len(result.Findings) != 3 {
-		t.Fatalf("expected the text target and script findings: result=%+v err=%v", result, err)
+	if err != nil || len(result.Findings) != 2 {
+		t.Fatalf("expected one finding each for the text target and script: result=%+v err=%v", result, err)
 	}
 	for _, p := range provider.fetched {
 		if strings.HasSuffix(p, ".md") {
@@ -152,7 +152,7 @@ func TestScanIncompleteListingOrFetchNeverClaimsFullCoverage(t *testing.T) {
 	}
 }
 
-func TestScanSubstitutionStillAppliesWhenTargetWasFetchedFirst(t *testing.T) {
+func TestScanSubstitutionDoesNotDuplicatePreviouslyFetchedTarget(t *testing.T) {
 	provider := &scanProvider{repositories: []Repository{{Provider: GitHubProvider, ID: "team/repo", Owner: true, Accessible: true}},
 		listing: FileListing{Complete: true, Files: []RepositoryFile{{Path: ".opencode/tools/secret.ts", Revision: "blob"}, {Path: "opencode.json", Revision: "config"}}},
 		contents: map[string]string{
@@ -162,12 +162,8 @@ func TestScanSubstitutionStillAppliesWhenTargetWasFetchedFirst(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rules := map[string]bool{}
-	for _, finding := range result.Findings {
-		rules[finding.CatalogRule] = true
-	}
-	if !rules["opencode.tool"] || !rules["opencode.file-substitution"] || len(provider.fetched) != 2 {
-		t.Fatalf("a prior fetch lost substitution attribution or fetched twice: findings=%+v fetched=%v", result.Findings, provider.fetched)
+	if len(result.Findings) != 1 || result.Findings[0].CatalogRule != "opencode.tool" || len(result.Findings[0].RelatedRules) != 1 || result.Findings[0].RelatedRules[0] != "opencode.file-substitution" || len(provider.fetched) != 2 || len(result.Repositories[0].Diagnostics.MatchedPaths) != 2 {
+		t.Fatalf("a prior fetch lost the substitution target or counted it twice: findings=%+v fetched=%v", result.Findings, provider.fetched)
 	}
 }
 

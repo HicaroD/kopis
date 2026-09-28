@@ -12,6 +12,18 @@ type journeyProvider struct {
 	provider string
 }
 
+type duplicateSkillProvider struct{}
+
+func (duplicateSkillProvider) Discover(context.Context, string) ([]Repository, error) {
+	return nil, nil
+}
+func (duplicateSkillProvider) ListFiles(context.Context, string, Repository) FileListing {
+	return FileListing{Complete: true, Files: []RepositoryFile{{Path: ".agents/skills/demo/runner.py", Revision: "pinned"}}}
+}
+func (duplicateSkillProvider) FetchFile(context.Context, string, Repository, RepositoryFile) FileOutcome {
+	return FileOutcome{Complete: true, Content: "api_key=synthetic-live-key-123"}
+}
+
 func (p journeyProvider) Discover(context.Context, string) ([]Repository, error) {
 	return []Repository{
 		{Provider: p.provider, ID: "complete/repository", Owner: true, Accessible: true},
@@ -80,6 +92,21 @@ func TestDeterministicProviderJourneysReachRedactedOutputs(t *testing.T) {
 	}
 }
 
+func TestScanCountsOneCredentialWhenTwoSkillRulesMatchSameFile(t *testing.T) {
+	result, err := Scan(context.Background(), ScanRequest{
+		Provider: GitHubProvider, Token: "runtime-token", Scope: Scope{Kind: ScopePublic},
+		Repositories: []Repository{{Provider: GitHubProvider, ID: "demo/repo", Public: true, Accessible: true}},
+		Catalog:      InitialCatalog(), Scanner: duplicateSkillProvider{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Findings) != 1 || result.Findings[0].Fingerprint != fingerprint("synthetic-live-key-123") ||
+		len(result.Findings[0].RelatedRules) != 1 || result.Findings[0].RelatedRules[0] != "gemini.skills" {
+		t.Fatalf("same source value counted more than once: %+v", result.Findings)
+	}
+}
+
 func TestCatalogSubstitutionAndClaudeMarkerBoundaries(t *testing.T) {
 	files := map[string]string{
 		"opencode.json":               `{"instructions":["{file:secrets.txt}"]}`,
@@ -112,7 +139,7 @@ func TestInspectionCredentialFormsLocationsSeverityAndExecution(t *testing.T) {
 		if finding.Location.StartByte < 0 || finding.Location.EndByte <= finding.Location.StartByte || finding.Location.StartLine < 1 {
 			t.Fatalf("invalid value location: %+v", finding)
 		}
-		if finding.Classification == ClassificationConfirmed && finding.Fingerprint == "" {
+		if finding.Classification == ClassificationLiteralCandidate && finding.Fingerprint == "" {
 			t.Fatalf("confirmed finding lacks fingerprint: %+v", finding)
 		}
 	}
@@ -134,12 +161,19 @@ func TestInspectionCredentialFormsLocationsSeverityAndExecution(t *testing.T) {
 func TestInspectionDetectsNestedJSONCredentialAtValueLocation(t *testing.T) {
 	content := "{\"mcpServers\":{\"provider\":{\"api_key\":\"synthetic-secret-123\",\"env\":{\"access_token\":\"${TOKEN}\"}}}}"
 	findings := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: content})
-	if len(findings) != 1 || findings[0].Indicator != "api_key" || findings[0].Classification != ClassificationConfirmed {
+	if len(findings) != 1 || findings[0].Indicator != "api_key" || findings[0].Classification != ClassificationLiteralCandidate {
 		t.Fatalf("nested JSON credential was not identified: %+v", findings)
 	}
 	f := findings[0]
 	if got := content[f.Location.StartByte:f.Location.EndByte]; got != "synthetic-secret-123" {
 		t.Fatalf("incorrect JSON source span: %q", got)
+	}
+}
+
+func TestLiteralMatchIsPresentedAsCandidateNotVerifiedCredential(t *testing.T) {
+	got := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: `{"mcpServers":{"remote":{"env":{"API_KEY":"synthetic-live-key-123"}}}}`})
+	if len(got) != 1 || got[0].Classification != "literal_candidate" || !strings.Contains(got[0].Guidance, "Review") || strings.Contains(got[0].Reason, "literal credential") {
+		t.Fatalf("unverified match claimed exposure: %+v", got)
 	}
 }
 
@@ -168,6 +202,18 @@ func TestInspectionDoesNotSilentlyIgnoreLiteralContainingExample(t *testing.T) {
 	findings := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: content})
 	if len(findings) != 1 || findings[0].Fingerprint != fingerprint("synthetic-example-value-456") {
 		t.Fatalf("ordinary substring falsely excluded a credential-shaped value: %+v", findings)
+	}
+}
+
+func TestConfigExamplesAndRefreshCommandAreNotCredentials(t *testing.T) {
+	settings := `{"awsAuthRefresh":"aws sso login --profile your-profile-here","env":{"API_KEY":"synthetic-live-key-123"}}`
+	got := Inspect(Candidate{Path: ".claude/settings.json", CatalogRule: "claude.settings", Content: settings})
+	if len(got) != 1 || got[0].Fingerprint != fingerprint("synthetic-live-key-123") {
+		t.Fatalf("refresh command reported or literal key lost: %+v", got)
+	}
+	template := "[connections.snowflake]\npassword = \"<YOUR_PASSWORD>\"\n"
+	if got := Inspect(Candidate{Path: ".agents/skills/demo/secrets.toml.example", CatalogRule: "gemini.skills", Content: template}); len(got) != 0 {
+		t.Fatalf("template placeholder reported: %+v", got)
 	}
 }
 
@@ -202,10 +248,19 @@ func TestInspectionCredentialURLIsHighUnlessDirectField(t *testing.T) {
 	}
 }
 
+func TestURLQueryWithAtSignIsNotAuthentication(t *testing.T) {
+	content := `font = "'Fira Sans':https://fonts.googleapis.com/css2?family=Fira+Sans:wght@400;500;600"` + "\n" +
+		`endpoint = "https://user:synthetic-live-pass-123@remote.test/path"`
+	got := Inspect(Candidate{Path: ".agents/skills/demo/themes/dracula.toml", CatalogRule: "gemini.skills", Content: content})
+	if len(got) != 1 || got[0].Fingerprint != fingerprint("https://user:synthetic-live-pass-123@remote.test/path") {
+		t.Fatalf("URL query reported as userinfo or genuine userinfo missed: %+v", got)
+	}
+}
+
 func TestInspectionFindsJSONEscapedShellPasswordWithoutExposingIt(t *testing.T) {
 	content := `{"permissions":{"allow":["Bash(PGPASSWORD=\"synthetic-db-pass-123\" psql:*)"]}}`
 	findings := Inspect(Candidate{Path: ".claude/settings.json", CatalogRule: "claude.settings", Content: content})
-	if len(findings) != 1 || findings[0].Indicator != "password" || findings[0].Classification != ClassificationConfirmed {
+	if len(findings) != 1 || findings[0].Indicator != "password" || findings[0].Classification != ClassificationLiteralCandidate {
 		t.Fatalf("escaped shell assignment not recognized: count=%d", len(findings))
 	}
 	finding := findings[0]
@@ -369,6 +424,16 @@ func TestPluginCommentsAreNotCredentialsOrExecutableBehavior(t *testing.T) {
 	got := Inspect(Candidate{Path: ".opencode/plugins/custom.ts", CatalogRule: "opencode.plugin", Content: content})
 	if len(got) != 1 || got[0].Fingerprint != fingerprint("synthetic-live-key-123") {
 		t.Fatalf("plugin comments reported or literal missed: %+v", got)
+	}
+}
+
+func TestPluginRegexPatternsAreNotCredentialLiterals(t *testing.T) {
+	content := "const secretPathPattern = /(^|\\/)(\\.env($|\\.)|.*key.*\\.pem$)/i;\n" +
+		"const shellSecretPathPattern = /(?:^|[\\s\"'`])([^\\s\"'`]*?\\.env)/gi;\n" +
+		"const apiKey = 'synthetic-live-key-123';\n"
+	got := Inspect(Candidate{Path: ".opencode/plugins/env-protection.js", CatalogRule: "opencode.plugin", Content: content})
+	if len(got) != 1 || got[0].Fingerprint != fingerprint("synthetic-live-key-123") {
+		t.Fatalf("regex pattern reported or actual literal missed: %+v", got)
 	}
 }
 

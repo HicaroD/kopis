@@ -72,7 +72,7 @@ func walkJSONValue(decoder *json.Decoder, candidate Candidate, path []string, fi
 			for _, match := range databaseURL.FindAllStringSubmatchIndex(candidate.Content[valueStart:valueEnd], -1) {
 				password := candidate.Content[valueStart+match[2] : valueStart+match[3]]
 				if literal(password) && !excluded(password) && !localCredentialURL(candidate.Content[valueStart+match[0]:valueStart+match[1]]) {
-					*findings = append(*findings, finding(candidate, "password", ClassificationConfirmed, SeverityHigh, password, valueStart+match[2], confirmedCredentialGuidance))
+					*findings = append(*findings, finding(candidate, "password", ClassificationLiteralCandidate, SeverityHigh, password, valueStart+match[2], literalCandidateGuidance))
 				}
 			}
 		}
@@ -81,7 +81,7 @@ func walkJSONValue(decoder *json.Decoder, candidate Candidate, path []string, fi
 			if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
 				if password, ok := parsed.User.Password(); ok && literal(password) && !excluded(password) && !localCredentialURL(value) {
 					if relative := strings.Index(candidate.Content[valueStart:valueEnd], password); relative >= 0 {
-						*findings = append(*findings, finding(candidate, "password", ClassificationConfirmed, SeverityHigh, password, valueStart+relative, confirmedCredentialGuidance))
+						*findings = append(*findings, finding(candidate, "password", ClassificationLiteralCandidate, SeverityHigh, password, valueStart+relative, literalCandidateGuidance))
 					}
 				}
 			}
@@ -98,8 +98,8 @@ func walkJSONValue(decoder *json.Decoder, candidate Candidate, path []string, fi
 		if directAuthenticationKey(key) || strings.Contains(key, "private") {
 			severity = SeverityCritical
 		}
-		*findings = append(*findings, findingAt(candidate, indicatorForKey(key), ClassificationConfirmed, severity, value,
-			valueStart, valueEnd, confirmedCredentialGuidance))
+		*findings = append(*findings, findingAt(candidate, indicatorForKey(key), ClassificationLiteralCandidate, severity, value,
+			valueStart, valueEnd, literalCandidateGuidance))
 	}
 	return nil
 }
@@ -115,7 +115,7 @@ func jsonCredentialField(path []string) bool {
 		}
 	}
 	switch strings.ToLower(path[len(path)-1]) {
-	case "description", "envvar", "env_key", "name":
+	case "description", "envvar", "env_key", "name", "awsauthrefresh":
 		return false
 	}
 	return true

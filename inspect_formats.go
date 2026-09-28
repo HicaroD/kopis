@@ -86,7 +86,7 @@ func inspectYAMLFields(candidate Candidate, values *yaml.Node) []Finding {
 			continue
 		}
 		if start := yamlValueOffset(candidate.Content, value); start >= 0 {
-			findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationConfirmed, SeverityHigh, value.Value, start, confirmedCredentialGuidance))
+			findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationLiteralCandidate, SeverityHigh, value.Value, start, literalCandidateGuidance))
 		}
 	}
 	return findings
@@ -137,7 +137,7 @@ func inspectTOML(candidate Candidate) []Finding {
 				start, end := assignmentValue(matches)
 				value := line[start:end]
 				if !strings.EqualFold(key, "env_key") && credentialAssignmentKey(key) && literal(value) && !excluded(value) && (section == "" || strings.HasSuffix(section, ".env") || strings.Contains(section, "provider")) {
-					findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationConfirmed, SeverityHigh, value, offset+start, confirmedCredentialGuidance))
+					findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationLiteralCandidate, SeverityHigh, value, offset+start, literalCandidateGuidance))
 				}
 			}
 		}
@@ -164,7 +164,7 @@ func inspectDotenv(candidate Candidate) []Finding {
 			valueStart, valueEnd := assignmentValue(match)
 			value := trimmed[valueStart:valueEnd]
 			if credentialAssignmentKey(key) && literal(value) && !excluded(value) {
-				findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationConfirmed, SeverityHigh, value, offset+start+valueStart, confirmedCredentialGuidance))
+				findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationLiteralCandidate, SeverityHigh, value, offset+start+valueStart, literalCandidateGuidance))
 			}
 		}
 		offset += len(line)
