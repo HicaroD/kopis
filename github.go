@@ -105,6 +105,7 @@ type githubSearchItem struct {
 type githubRepository struct {
 	FullName string `json:"full_name"`
 	HTMLURL  string `json:"html_url"`
+	Private  bool   `json:"private"`
 }
 
 type githubBlobResponse struct {

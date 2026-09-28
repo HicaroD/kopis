@@ -14,6 +14,8 @@ import (
 type Presentation struct {
 	Repositories []PresentedRepository `json:"repositories"`
 	Findings     []Finding             `json:"findings"`
+	Crawl        *CrawlCoverage        `json:"crawl,omitempty"`
+	Leads        *LeadCoverage         `json:"leads,omitempty"`
 	Complete     bool                  `json:"complete"`
 	ExitCode     int                   `json:"exit_code"`
 }
@@ -30,7 +32,10 @@ type PresentedRepository struct {
 // terminal and JSONL output.
 func Present(result ScanResult) Presentation {
 	findings := append([]Finding(nil), result.Findings...)
-	presentation := Presentation{Findings: findings, Complete: true}
+	presentation := Presentation{Findings: findings, Complete: true, Crawl: result.Crawl, Leads: result.Leads}
+	if result.Leads != nil || result.Crawl != nil && !result.Crawl.Complete {
+		presentation.Complete = false
+	}
 	for i := range presentation.Findings {
 		presentation.Findings[i].RepositoryURL = redactURL(presentation.Findings[i].RepositoryURL)
 	}
@@ -69,6 +74,23 @@ func WriteTerminal(w io.Writer, result ScanResult) error {
 	}
 	if _, err := fmt.Fprintf(w, "Scan: %s | %d %s | %d %s\n", state, len(presentation.Repositories), repositoryLabel, len(presentation.Findings), findingLabel); err != nil {
 		return err
+	}
+	if presentation.Crawl != nil {
+		c := presentation.Crawl
+		if _, err := fmt.Fprintf(w, "Public crawl: %s | scanned: %d | pending: %d | gaps: %d | last ID: %d | end ID: %d\n", c.Instance, c.Scanned, c.Pending, c.Gaps, c.LastID, c.EndID); err != nil {
+			return err
+		}
+		if c.DiscoveryFailure != "" {
+			if _, err := fmt.Fprintf(w, "Discovery: %s\n", c.DiscoveryFailure); err != nil {
+				return err
+			}
+		}
+	}
+	if presentation.Leads != nil {
+		l := presentation.Leads
+		if _, err := fmt.Fprintf(w, "Indexed GitHub leads: %d/%d queries | matches: %d | eligible: %d | filtered: %d | next query: %d | next page: %d | saturated: %d | failures: %d | coverage: incomplete\n", l.QueriesRun, l.QueriesPlanned, l.RawMatches, l.EligibleMatches, l.FilteredMatches, l.NextQuery, l.NextPage, len(l.Saturated), len(l.Failures)); err != nil {
+			return err
+		}
 	}
 	for _, repository := range presentation.Repositories {
 		if _, err := fmt.Fprintf(w, "\nRepository: %s/%s\n  status: %s | findings: %d\n", repository.Provider, repository.Repository, repository.Status, repository.Findings); err != nil {

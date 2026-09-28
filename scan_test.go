@@ -223,6 +223,17 @@ func TestScanExcludesDeniedDefaultRepositories(t *testing.T) {
 	}
 }
 
+func TestPublicScopeSelectsPublicRepositoriesWithoutClaimingOwnership(t *testing.T) {
+	provider := &scanProvider{listing: FileListing{Complete: true}}
+	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "token", Scope: Scope{Kind: ScopePublic}, Scanner: provider, Repositories: []Repository{
+		{Provider: GitHubProvider, ID: "public/one", Public: true, Accessible: true},
+		{Provider: GitHubProvider, ID: "private/one", Accessible: true},
+	}})
+	if err != nil || len(result.Repositories) != 1 || result.Repositories[0].Repository.ID != "public/one" || result.Repositories[0].Repository.Owner {
+		t.Fatalf("public crawl included non-public repository or forged ownership: result=%+v err=%v", result, err)
+	}
+}
+
 func TestScanDiscoveryFailurePreservesExplicitRepositoriesAsUnscanned(t *testing.T) {
 	provider := &scanProvider{discoverErr: errors.New("provider unavailable")}
 	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "runtime-token", Scanner: provider, Scope: Scope{Kind: ScopeList, RepositoryIDs: []string{"one/repo", "two/repo"}}})

@@ -54,22 +54,26 @@ var (
 func Inspect(candidate Candidate) []Finding {
 	var findings []Finding
 	content := candidate.Content
-	for _, match := range assignment.FindAllStringSubmatchIndex(content, -1) {
-		valueStart, valueEnd := assignmentValue(match)
-		value := content[valueStart:valueEnd]
-		value, valueStart = literalAssignmentValue(value, valueStart)
-		keyName := content[match[2]:match[3]]
-		if !credentialAssignmentKey(keyName) || excluded(value) || !literal(value) {
-			continue
+	jsonFindings, structured := inspectJSONCredentials(candidate)
+	findings = append(findings, jsonFindings...)
+	if !structured {
+		for _, match := range assignment.FindAllStringSubmatchIndex(content, -1) {
+			valueStart, valueEnd := assignmentValue(match)
+			value := content[valueStart:valueEnd]
+			value, valueStart = literalAssignmentValue(value, valueStart)
+			keyName := content[match[2]:match[3]]
+			if !credentialAssignmentKey(keyName) || excluded(value) || !literal(value) {
+				continue
+			}
+			key := strings.ToLower(keyName)
+			indicator := indicatorForKey(key)
+			classification := ClassificationConfirmed
+			severity := SeverityHigh
+			if directAuthenticationKey(key) || strings.Contains(key, "private") {
+				severity = SeverityCritical
+			}
+			findings = append(findings, finding(candidate, indicator, classification, severity, value, valueStart, confirmedCredentialGuidance))
 		}
-		key := strings.ToLower(keyName)
-		indicator := indicatorForKey(key)
-		classification := ClassificationConfirmed
-		severity := SeverityHigh
-		if directAuthenticationKey(key) || strings.Contains(key, "private") {
-			severity = SeverityCritical
-		}
-		findings = append(findings, finding(candidate, indicator, classification, severity, value, valueStart, confirmedCredentialGuidance))
 	}
 	for _, match := range escapedAssignment.FindAllStringSubmatchIndex(content, -1) {
 		value := content[match[4]:match[5]]
@@ -150,11 +154,15 @@ func uniqueFindings(findings []Finding) []Finding {
 }
 
 func finding(c Candidate, indicator, classification, severity, value string, offset int, guidance string) Finding {
+	return findingAt(c, indicator, classification, severity, value, offset, offset+len(value), guidance)
+}
+
+func findingAt(c Candidate, indicator, classification, severity, value string, start, end int, guidance string) Finding {
 	fingerprintValue := ""
 	if classification == ClassificationConfirmed {
 		fingerprintValue = fingerprint(value)
 	}
-	return Finding{Provider: c.Provider, Repository: c.Repository, RepositoryURL: safeURL(c.RepositoryURL), Revision: c.Revision, Path: c.Path, Tool: c.Tool, CatalogRule: c.CatalogRule, Indicator: indicator, Classification: classification, Severity: severity, Fingerprint: fingerprintValue, Location: location(c.Content, offset, offset+len(value)), Guidance: guidance, Reason: reasonFor(classification)}
+	return Finding{Provider: c.Provider, Repository: c.Repository, RepositoryURL: safeURL(c.RepositoryURL), Revision: c.Revision, Path: c.Path, Tool: c.Tool, CatalogRule: c.CatalogRule, Indicator: indicator, Classification: classification, Severity: severity, Fingerprint: fingerprintValue, Location: location(c.Content, start, end), Guidance: guidance, Reason: reasonFor(classification)}
 }
 
 func isExecutableRule(rule string) bool {
@@ -226,7 +234,9 @@ func credentialAssignmentKey(key string) bool {
 }
 func excluded(value string) bool {
 	lower := strings.ToLower(value)
-	return strings.HasPrefix(value, "process.env.") || strings.HasPrefix(value, "import.meta.env.") || strings.Contains(lower, "example") || strings.Contains(lower, "placeholder") || strings.Contains(lower, "redacted") || strings.Contains(lower, "xxxxx") || strings.Contains(lower, "your_") || strings.Contains(lower, "your-") || strings.Contains(lower, "<token>")
+	return strings.HasPrefix(value, "process.env.") || strings.HasPrefix(value, "import.meta.env.") ||
+		lower == "example" || lower == "placeholder" || lower == "redacted" || lower == "xxxxx" || lower == "<token>" ||
+		strings.HasPrefix(lower, "your_") || strings.HasPrefix(lower, "your-")
 }
 func reasonFor(classification string) string {
 	if classification == ClassificationReviewRequired {

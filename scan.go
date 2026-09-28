@@ -18,6 +18,7 @@ const (
 	RepositoryUnscanned            = "unscanned"
 
 	ScopeDefault    = "default"
+	ScopePublic     = "public"
 	ScopeRepository = "repository"
 	ScopeList       = "list"
 )
@@ -34,8 +35,8 @@ type Repository struct {
 	Accessible   bool
 }
 
-// Scope narrows the default authorized repository set. IDs are provider
-// canonical identifiers, one per entry.
+// Scope selects a discovered public batch or narrows the token-associated
+// repository set. Explicit IDs are provider canonical identifiers.
 type Scope struct {
 	Kind          string
 	RepositoryIDs []string
@@ -140,6 +141,38 @@ type ScanDiagnostics struct {
 type ScanResult struct {
 	Repositories []RepositoryResult
 	Findings     []Finding
+	Crawl        *CrawlCoverage
+	Leads        *LeadCoverage
+}
+
+// LeadCoverage is deliberately incomplete: indexed search finds likely
+// repositories, but cannot establish the absence of unindexed files.
+type LeadCoverage struct {
+	QueriesPlanned  int      `json:"queries_planned"`
+	QueriesRun      int      `json:"queries_run"`
+	NextQuery       int      `json:"next_query"`
+	NextPage        int      `json:"next_page,omitempty"`
+	RawMatches      int      `json:"raw_matches"`
+	EligibleMatches int      `json:"eligible_matches"`
+	FilteredMatches int      `json:"filtered_matches"`
+	Saturated       []string `json:"saturated_queries,omitempty"`
+	Failures        []string `json:"failures,omitempty"`
+}
+
+// CrawlCoverage describes a public pass, independently of the repositories
+// returned by this invocation. An unfinished pass is never complete.
+type CrawlCoverage struct {
+	Provider         string   `json:"provider"`
+	Instance         string   `json:"instance"`
+	EndID            int64    `json:"end_id,omitempty"`
+	LastID           int64    `json:"last_id"`
+	Scanned          int64    `json:"scanned"`
+	Pending          int      `json:"pending"`
+	Gaps             int      `json:"gaps"`
+	GapRepositories  []string `json:"gap_repositories,omitempty"`
+	DiscoveryFailure string   `json:"discovery_failure,omitempty"`
+	EnumerationDone  bool     `json:"enumeration_done"`
+	Complete         bool     `json:"complete"`
 }
 
 // Scan performs authorized, catalog-derived discovery and targeted inspection.
@@ -154,8 +187,14 @@ func Scan(ctx context.Context, request ScanRequest) (ScanResult, error) {
 	if request.Scope.Kind == "" {
 		request.Scope.Kind = ScopeDefault
 	}
-	if request.Scope.Kind != ScopeDefault && (len(request.Scope.RepositoryIDs) == 0 || (request.Scope.Kind != ScopeRepository && request.Scope.Kind != ScopeList)) {
+	if request.Scope.Kind == ScopePublic && request.Repositories == nil {
+		return ScanResult{}, errors.New("public scope requires a discovered repository batch")
+	}
+	if request.Scope.Kind != ScopeDefault && request.Scope.Kind != ScopePublic && (len(request.Scope.RepositoryIDs) == 0 || (request.Scope.Kind != ScopeRepository && request.Scope.Kind != ScopeList)) {
 		return ScanResult{}, errors.New("invalid repository scope")
+	}
+	if request.Scope.Kind == ScopePublic && len(request.Scope.RepositoryIDs) != 0 {
+		return ScanResult{}, errors.New("invalid public repository scope")
 	}
 
 	repositories := request.Repositories
@@ -297,6 +336,12 @@ func selectRepositories(repositories []Repository, provider string, scope Scope)
 				selected = append(selected, repository)
 			} else if repository.Owner || repository.Member || repository.Collaborator {
 				invalid = append(invalid, RepositoryResult{Repository: repository})
+			}
+			continue
+		}
+		if scope.Kind == ScopePublic {
+			if repository.Public && repository.Accessible {
+				selected = append(selected, repository)
 			}
 			continue
 		}

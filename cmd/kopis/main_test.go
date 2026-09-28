@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -43,6 +45,433 @@ func TestRuntimeProviderPaginatesDefaultDiscovery(t *testing.T) {
 				t.Fatalf("default discovery did not exhaust pages: repositories=%+v err=%v", repositories, err)
 			}
 		})
+	}
+}
+
+func TestNoScopeCrawlsPublicRepositoriesInBoundedResumableBatches(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repositories":
+			if r.URL.Query().Get("since") == "" {
+				w.Header().Set("Link", "<http://"+r.Host+"/repositories?since=2>; rel=\"next\"")
+				_, _ = w.Write([]byte(`[{"id":1,"full_name":"public/one"},{"id":2,"full_name":"public/two"}]`))
+			} else {
+				_, _ = w.Write([]byte(`[{"id":3,"full_name":"public/three"}]`))
+			}
+		case "/user/repos":
+			t.Error("no-scope crawl used token-associated discovery")
+			http.NotFound(w, r)
+		case "/repos/public/one", "/repos/public/two", "/repos/public/three":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/repos/public/one/commits/main", "/repos/public/two/commits/main", "/repos/public/three/commits/main":
+			_, _ = w.Write([]byte(`{"sha":"commit","commit":{"tree":{"sha":"tree"}}}`))
+		case "/repos/public/one/git/trees/tree", "/repos/public/two/git/trees/tree", "/repos/public/three/git/trees/tree":
+			_, _ = w.Write([]byte(`{"tree":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	checkpoint := filepath.Join(t.TempDir(), "checkpoint.json")
+	args := []string{"-provider", "github", "-base-url", server.URL, "-checkpoint", checkpoint, "-batch-size", "1", "-format", "jsonl"}
+	for index, wantComplete := range []bool{false, false, true} {
+		var output, diagnostic bytes.Buffer
+		status := run(args, strings.NewReader(""), &output, &diagnostic)
+		var report kopis.Presentation
+		if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+			t.Fatalf("batch %d: invalid report %q: %v; stderr=%q", index, output.String(), err, diagnostic.String())
+		}
+		if report.Complete != wantComplete || len(report.Repositories) != 1 || report.Repositories[0].Repository != []string{"public/one", "public/two", "public/three"}[index] {
+			t.Fatalf("batch %d: wrong coverage or resumed repository: %+v stderr=%q", index, report, diagnostic.String())
+		}
+		if (status == 0) != wantComplete {
+			t.Fatalf("batch %d: exit code %d for complete=%t", index, status, wantComplete)
+		}
+	}
+}
+
+func TestChangedInspectorDoesNotResumeEarlierCoverageCheckpoint(t *testing.T) {
+	oldCatalog, err := json.Marshal(kopis.InitialCatalog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFingerprint := sha256.Sum256(oldCatalog)
+	path := filepath.Join(t.TempDir(), "old.json")
+	data, err := json.Marshal(crawlCheckpoint{Version: checkpointVersion, Provider: "github", Instance: "https://api.github.com", Catalog: fmt.Sprintf("%x", oldFingerprint), LastID: 531})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCrawl(path, "github", "https://api.github.com", catalogIdentity(kopis.InitialCatalog())); err == nil {
+		t.Fatal("an earlier detector checkpoint would silently skip repositories requiring a rescan")
+	}
+}
+
+func TestGitHubSearchLeadsRunsNormalRepositoryScanAndReportsIncompleteCoverage(t *testing.T) {
+	var unexpected []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search/code":
+			if r.URL.Query().Get("q") != "filename:opencode.json" {
+				t.Errorf("wrong catalog query: %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 2, "items": []any{
+				map[string]any{"path": "opencode.json", "repository": map[string]any{"full_name": "public/one", "html_url": "https://github.com/public/one"}},
+				map[string]any{"path": "notes.txt", "repository": map[string]any{"full_name": "public/other"}},
+			}})
+		case "/repos/public/one":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/repos/public/one/commits/main":
+			_, _ = w.Write([]byte(`{"sha":"commit","commit":{"tree":{"sha":"tree"}}}`))
+		case "/repos/public/one/git/trees/tree":
+			_, _ = w.Write([]byte(`{"tree":[{"path":"opencode.json","type":"blob","sha":"blob"},{"path":"notes.txt","type":"blob","sha":"other"}]}`))
+		case "/repos/public/one/git/blobs/blob":
+			_ = json.NewEncoder(w).Encode(map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte(`{"api_key":"synthetic-value-123"}`))})
+		default:
+			unexpected = append(unexpected, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	var output, diagnostic bytes.Buffer
+	code := run([]string{"-provider", "github", "-base-url", server.URL, "-search-leads", "-format", "jsonl"}, strings.NewReader(""), &output, &diagnostic)
+	var report kopis.Presentation
+	if err := json.Unmarshal(output.Bytes(), &report); err != nil || code != 2 || report.Complete || len(report.Repositories) != 1 || len(report.Findings) != 1 || report.Leads == nil || report.Leads.QueriesRun != 1 || len(unexpected) != 0 {
+		t.Fatalf("lead search skipped repository inspection or claimed coverage: code=%d report=%+v err=%v unexpected=%v diagnostic=%q", code, report, err, unexpected, diagnostic.String())
+	}
+}
+
+func TestGitLabPublicCrawlStopsAtRecordedUpperID(t *testing.T) {
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.String())
+		switch r.URL.Path {
+		case "/api/v4/projects":
+			if r.URL.Query().Get("membership") != "" || r.URL.Query().Get("visibility") != "public" || r.URL.Query().Get("pagination") != "keyset" || r.URL.Query().Get("order_by") != "id" {
+				t.Errorf("wrong public keyset query: %s", r.URL.RawQuery)
+			}
+			if r.URL.Query().Get("sort") == "desc" {
+				_, _ = w.Write([]byte(`[{"id":2}]`))
+				return
+			}
+			if r.URL.Query().Get("id_after") == "" {
+				w.Header().Set("Link", "<http://"+r.Host+"/api/v4/projects?pagination=keyset&id_after=1>; rel=\"next\"")
+				_, _ = w.Write([]byte(`[{"id":1,"path_with_namespace":"public/one","visibility":"public"}]`))
+			} else {
+				_, _ = w.Write([]byte(`[{"id":2,"path_with_namespace":"public/two","visibility":"public"},{"id":3,"path_with_namespace":"public/new","visibility":"public"}]`))
+			}
+		case "/api/v4/projects/public/one", "/api/v4/projects/public/two":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/api/v4/projects/public/one/repository/commits/main", "/api/v4/projects/public/two/repository/commits/main":
+			_, _ = w.Write([]byte(`{"id":"commit"}`))
+		case "/api/v4/projects/public/one/repository/tree", "/api/v4/projects/public/two/repository/tree":
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			t.Errorf("unexpected public crawl request: %s", r.URL)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITLAB_TOKEN", "runtime-token")
+	checkpoint := filepath.Join(t.TempDir(), "checkpoint.json")
+	args := []string{"-provider", "gitlab", "-base-url", server.URL, "-checkpoint", checkpoint, "-batch-size", "1", "-format", "jsonl"}
+	for i, complete := range []bool{false, true} {
+		var out, diagnostic bytes.Buffer
+		code := run(args, strings.NewReader(""), &out, &diagnostic)
+		var report kopis.Presentation
+		if err := json.Unmarshal(out.Bytes(), &report); err != nil || report.Crawl == nil || report.Crawl.EndID != 2 || report.Complete != complete || len(report.Repositories) != 1 || report.Repositories[0].Repository != []string{"public/one", "public/two"}[i] || (code == 0) != complete {
+			t.Fatalf("run %d: code=%d report=%+v err=%v diagnostic=%q", i, code, report, err, diagnostic.String())
+		}
+	}
+}
+
+func TestPublicCrawlRetriesPartialRepositoryBeforeCompleting(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repositories":
+			_, _ = w.Write([]byte(`[{"id":1,"full_name":"public/one"}]`))
+		case "/repos/public/one":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/repos/public/one/commits/main":
+			_, _ = w.Write([]byte(`{"sha":"commit","commit":{"tree":{"sha":"tree"}}}`))
+		case "/repos/public/one/git/trees/tree":
+			attempts++
+			if attempts == 1 {
+				_, _ = w.Write([]byte(`{"truncated":true,"tree":[]}`))
+			} else {
+				_, _ = w.Write([]byte(`{"tree":[]}`))
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	args := []string{"-provider", "github", "-base-url", server.URL, "-checkpoint", filepath.Join(t.TempDir(), "crawl.json"), "-batch-size", "1", "-format", "jsonl"}
+	for i, complete := range []bool{false, true} {
+		var out, diagnostic bytes.Buffer
+		code := run(args, strings.NewReader(""), &out, &diagnostic)
+		var report kopis.Presentation
+		if err := json.Unmarshal(out.Bytes(), &report); err != nil || report.Crawl == nil || report.Complete != complete || (code == 0) != complete || len(report.Repositories) != 1 {
+			t.Fatalf("run %d: code=%d report=%+v err=%v diagnostic=%q", i, code, report, err, diagnostic.String())
+		}
+	}
+	if attempts != 2 {
+		t.Fatalf("expected partial repository retry, got %d attempts", attempts)
+	}
+}
+
+func TestNewPassStartsAfterCompletedPublicBoundary(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repositories":
+			if r.URL.Query().Get("since") == "1" {
+				_, _ = w.Write([]byte(`[{"id":2,"full_name":"public/two"}]`))
+			} else {
+				_, _ = w.Write([]byte(`[{"id":1,"full_name":"public/one"}]`))
+			}
+		case "/repos/public/one", "/repos/public/two":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/repos/public/one/commits/main", "/repos/public/two/commits/main":
+			_, _ = w.Write([]byte(`{"sha":"commit","commit":{"tree":{"sha":"tree"}}}`))
+		case "/repos/public/one/git/trees/tree", "/repos/public/two/git/trees/tree":
+			_, _ = w.Write([]byte(`{"tree":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	args := []string{"-provider", "github", "-base-url", server.URL, "-checkpoint", filepath.Join(t.TempDir(), "crawl.json"), "-format", "jsonl"}
+	var first, second, diagnostic bytes.Buffer
+	if code := run(args, strings.NewReader(""), &first, &diagnostic); code != 0 {
+		t.Fatalf("initial pass failed: code=%d stderr=%q", code, diagnostic.String())
+	}
+	diagnostic.Reset()
+	if code := run(append(append([]string(nil), args...), "-new-pass"), strings.NewReader(""), &second, &diagnostic); code != 0 {
+		t.Fatalf("next pass failed: code=%d stderr=%q", code, diagnostic.String())
+	}
+	var report kopis.Presentation
+	if err := json.Unmarshal(second.Bytes(), &report); err != nil || !report.Complete || len(report.Repositories) != 1 || report.Repositories[0].Repository != "public/two" {
+		t.Fatalf("next pass revisited previous range: %+v err=%v", report, err)
+	}
+}
+
+func TestNewPassWithNoNewRepositoriesRetainsBoundary(t *testing.T) {
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repositories" {
+			switch {
+			case r.URL.Path == "/repos/public/one":
+				_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+			case strings.HasSuffix(r.URL.Path, "/commits/main"):
+				_, _ = w.Write([]byte(`{"sha":"commit","commit":{"tree":{"sha":"tree"}}}`))
+			case strings.HasSuffix(r.URL.Path, "/git/trees/tree"):
+				_, _ = w.Write([]byte(`{"tree":[]}`))
+			default:
+				http.NotFound(w, r)
+			}
+			return
+		}
+		requests = append(requests, r.URL.Query().Get("since"))
+		if r.URL.Query().Get("since") == "" {
+			_, _ = w.Write([]byte(`[{"id":1,"full_name":"public/one"}]`))
+		} else {
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	args := []string{"-provider", "github", "-base-url", server.URL, "-checkpoint", filepath.Join(t.TempDir(), "crawl.json"), "-format", "jsonl"}
+	for i := 0; i < 3; i++ {
+		var out, diagnostic bytes.Buffer
+		runArgs := append([]string(nil), args...)
+		if i > 0 {
+			runArgs = append(runArgs, "-new-pass")
+		}
+		if code := run(runArgs, strings.NewReader(""), &out, &diagnostic); code != 0 {
+			t.Fatalf("pass %d failed: %s", i, diagnostic.String())
+		}
+	}
+	if strings.Join(requests, ",") != ",1,1" {
+		t.Fatalf("new pass restarted the full crawl: %v", requests)
+	}
+}
+
+func TestExhaustedPublicRepositoryRemainsAnIdentifiedCoverageGap(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repositories":
+			_, _ = w.Write([]byte(`[{"id":1,"full_name":"public/broken"}]`))
+		case "/repos/public/broken":
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	args := []string{"-provider", "github", "-base-url", server.URL, "-checkpoint", filepath.Join(t.TempDir(), "crawl.json"), "-batch-size", "1", "-format", "jsonl"}
+	for i := 0; i < 3; i++ {
+		var out, diagnostic bytes.Buffer
+		code := run(args, strings.NewReader(""), &out, &diagnostic)
+		var report kopis.Presentation
+		if err := json.Unmarshal(out.Bytes(), &report); err != nil || code != 2 || report.Complete || report.Crawl == nil {
+			t.Fatalf("attempt %d: code=%d report=%+v err=%v diagnostic=%q", i, code, report, err, diagnostic.String())
+		}
+		if i == 2 && (report.Crawl.Gaps != 1 || len(report.Crawl.GapRepositories) != 1 || report.Crawl.GapRepositories[0] != "public/broken") {
+			t.Fatalf("exhausted failure was not identified: %+v", report.Crawl)
+		}
+	}
+}
+
+func TestPublicRetryWaitsForAnotherRun(t *testing.T) {
+	var attempted int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repositories" {
+			_, _ = w.Write([]byte(`[{"id":1,"full_name":"public/broken"}]`))
+			return
+		}
+		if r.URL.Path == "/repos/public/broken" {
+			attempted++
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	var out, diagnostic bytes.Buffer
+	code := run([]string{"-provider", "github", "-base-url", server.URL, "-checkpoint", filepath.Join(t.TempDir(), "crawl.json"), "-batch-size", "100", "-format", "jsonl"}, strings.NewReader(""), &out, &diagnostic)
+	if code != 2 || attempted != 1 {
+		t.Fatalf("retry consumed the same run: code=%d attempts=%d stderr=%q", code, attempted, diagnostic.String())
+	}
+}
+
+func TestFailedPublicDiscoveryResumesFromCommittedCursor(t *testing.T) {
+	var fail bool = true
+	var cursors []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repositories":
+			cursor := r.URL.Query().Get("since")
+			cursors = append(cursors, cursor)
+			if cursor == "" {
+				w.Header().Set("Link", "<http://"+r.Host+"/repositories?since=1>; rel=\"next\"")
+				_, _ = w.Write([]byte(`[{"id":1,"full_name":"public/one"}]`))
+			} else if fail {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			} else {
+				_, _ = w.Write([]byte(`[{"id":2,"full_name":"public/two"}]`))
+			}
+		case "/repos/public/one", "/repos/public/two":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/repos/public/one/commits/main", "/repos/public/two/commits/main":
+			_, _ = w.Write([]byte(`{"sha":"commit","commit":{"tree":{"sha":"tree"}}}`))
+		case "/repos/public/one/git/trees/tree", "/repos/public/two/git/trees/tree":
+			_, _ = w.Write([]byte(`{"tree":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	checkpoint := filepath.Join(t.TempDir(), "crawl.json")
+	args := []string{"-provider", "github", "-base-url", server.URL, "-checkpoint", checkpoint, "-batch-size", "10", "-format", "jsonl"}
+	for i := 0; i < 2; i++ {
+		var out, diagnostic bytes.Buffer
+		code := run(args, strings.NewReader(""), &out, &diagnostic)
+		var report kopis.Presentation
+		if err := json.Unmarshal(out.Bytes(), &report); err != nil || (code == 0) != (i == 1) || len(report.Repositories) != 1 || report.Repositories[0].Repository != []string{"public/one", "public/two"}[i] || (i == 0 && (report.Crawl == nil || report.Crawl.DiscoveryFailure == "")) {
+			t.Fatalf("run %d: code=%d report=%+v err=%v stderr=%q", i, code, report, err, diagnostic.String())
+		}
+		fail = false
+	}
+	if strings.Join(cursors, ",") != ",1,1" {
+		t.Fatalf("discovery skipped or repeated committed work: %v", cursors)
+	}
+}
+
+func TestFailedReportWriteRetainsCrawlFindingsForNextRun(t *testing.T) {
+	var fetched int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repositories":
+			_, _ = w.Write([]byte(`[{"id":1,"full_name":"public/one"}]`))
+		case "/repos/public/one":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/repos/public/one/commits/main":
+			_, _ = w.Write([]byte(`{"sha":"commit","commit":{"tree":{"sha":"tree"}}}`))
+		case "/repos/public/one/git/trees/tree":
+			_, _ = w.Write([]byte(`{"tree":[{"path":"opencode.json","type":"blob","sha":"blob"}]}`))
+		case "/repos/public/one/git/blobs/blob":
+			fetched++
+			_ = json.NewEncoder(w).Encode(map[string]string{"encoding": "base64", "content": base64.StdEncoding.EncodeToString([]byte("api_key=literal-secret"))})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	checkpoint := filepath.Join(t.TempDir(), "checkpoint.json")
+	args := []string{"-provider", "github", "-base-url", server.URL, "-checkpoint", checkpoint, "-format", "jsonl"}
+	var out, diagnostic bytes.Buffer
+	if code := run(append(append([]string(nil), args...), "-o", t.TempDir()), strings.NewReader(""), &out, &diagnostic); code != 1 {
+		t.Fatalf("expected report write failure: %d %s", code, diagnostic.String())
+	}
+	out.Reset()
+	diagnostic.Reset()
+	if code := run(args, strings.NewReader(""), &out, &diagnostic); code != 0 {
+		t.Fatalf("resume failed: %d %s", code, diagnostic.String())
+	}
+	var report kopis.Presentation
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil || len(report.Findings) != 1 || fetched != 1 {
+		t.Fatalf("undelivered findings lost or rescanned: report=%+v fetches=%d err=%v", report, fetched, err)
+	}
+	if strings.Contains(out.String(), "literal-secret") {
+		t.Fatal("checkpoint report exposed source content")
+	}
+}
+
+func TestRecoveredRepositoryReplacesUndeliveredPartialStatus(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repositories":
+			_, _ = w.Write([]byte(`[{"id":1,"full_name":"public/one"}]`))
+		case "/repos/public/one":
+			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case "/repos/public/one/commits/main":
+			_, _ = w.Write([]byte(`{"sha":"commit","commit":{"tree":{"sha":"tree"}}}`))
+		case "/repos/public/one/git/trees/tree":
+			attempts++
+			if attempts == 1 {
+				_, _ = w.Write([]byte(`{"truncated":true,"tree":[]}`))
+			} else {
+				_, _ = w.Write([]byte(`{"tree":[]}`))
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "runtime-token")
+	args := []string{"-provider", "github", "-base-url", server.URL, "-checkpoint", filepath.Join(t.TempDir(), "checkpoint.json"), "-format", "jsonl"}
+	var out, diagnostic bytes.Buffer
+	if code := run(append(append([]string(nil), args...), "-o", t.TempDir()), strings.NewReader(""), &out, &diagnostic); code != 1 {
+		t.Fatalf("expected report failure, got %d", code)
+	}
+	out.Reset()
+	diagnostic.Reset()
+	code := run(args, strings.NewReader(""), &out, &diagnostic)
+	var report kopis.Presentation
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil || code != 0 || !report.Complete || len(report.Repositories) != 1 || report.Repositories[0].Status != kopis.RepositoryNoCandidateArtifacts {
+		t.Fatalf("retry did not supersede partial status: code=%d report=%+v err=%v stderr=%q", code, report, err, diagnostic.String())
 	}
 }
 
@@ -304,7 +733,7 @@ func TestRunReportsProgressBeforeScanCompletes(t *testing.T) {
 	messages := make(chan string, 100)
 	done := make(chan int, 1)
 	go func() {
-		done <- run([]string{"-provider", "github", "-base-url", server.URL, "-format", "jsonl"}, strings.NewReader(""), &output, progressWriter{messages})
+		done <- run([]string{"-provider", "github", "-base-url", server.URL, "-token-associated", "-format", "jsonl"}, strings.NewReader(""), &output, progressWriter{messages})
 	}()
 	select {
 	case <-secondListing:
@@ -539,6 +968,9 @@ func TestRunCompleteAndIncompleteJourneysThroughRuntimeAdapters(t *testing.T) {
 				}
 				args := []string{"-provider", provider, "-base-url", server.URL, "-format", format}
 				stdin := strings.NewReader("")
+				if scopeMode == "default" {
+					args = append(args, "-token-associated")
+				}
 				if scopeMode == "explicit" {
 					args = append(args, "-scope-file", "-")
 					stdin = strings.NewReader("team/complete\nteam/partial\nteam/denied\n")

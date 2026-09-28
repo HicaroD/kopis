@@ -190,8 +190,16 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	providerName := flags.String("provider", "", "provider: github or gitlab")
 	baseURL := flags.String("base-url", "", "provider API base URL")
 	tokenEnv := flags.String("token-env", "", "environment variable containing the runtime token")
-	scope := flags.String("scope", "", "comma-separated repository IDs; omit for authorized default scope")
+	scope := flags.String("scope", "", "comma-separated repository IDs; omit for public crawl")
 	scopeFile := flags.String("scope-file", "", "file containing one repository ID per line, or - for standard input")
+	tokenAssociated := flags.Bool("token-associated", false, "scan repositories associated with the token instead of the public crawl")
+	checkpoint := flags.String("checkpoint", "", "public crawl checkpoint file (defaults to an instance-specific file)")
+	batchSize := flags.Int("batch-size", 100, "maximum repositories to inspect per public crawl run")
+	newPass := flags.Bool("new-pass", false, "start a new public pass after a completed pass")
+	searchLeads := flags.Bool("search-leads", false, "find likely GitHub repositories using indexed code search, then inspect them (incomplete coverage)")
+	leadStart := flags.Int("lead-start", 0, "index of the first catalog-derived GitHub lead query")
+	leadQueries := flags.Int("lead-queries", 1, "number of catalog-derived GitHub lead queries to run")
+	leadPage := flags.Int("lead-page", 1, "result page for a single GitHub lead query (1-10)")
 	format := flags.String("format", "terminal", "output format: terminal or jsonl")
 	outputPath := flags.String("o", "", "write the report to this file (overwrites an existing report)")
 	explain := flags.Bool("explain", false, "report catalog path handoffs on standard error without file content")
@@ -208,6 +216,22 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	}
 	if *scope != "" && *scopeFile != "" {
 		fmt.Fprintln(stderr, "kopis: scope and scope-file are mutually exclusive")
+		return 1
+	}
+	if *batchSize < 1 || ((*scope != "" || *scopeFile != "" || *tokenAssociated) && *checkpoint != "") {
+		fmt.Fprintln(stderr, "kopis: invalid batch size or checkpoint combined with non-public scope")
+		return 1
+	}
+	if *tokenAssociated && (*scope != "" || *scopeFile != "") {
+		fmt.Fprintln(stderr, "kopis: token-associated mode cannot be combined with scope")
+		return 1
+	}
+	if *newPass && (*scope != "" || *scopeFile != "" || *tokenAssociated) {
+		fmt.Fprintln(stderr, "kopis: new-pass requires public crawl mode")
+		return 1
+	}
+	if *searchLeads && (*providerName != kopis.GitHubProvider || *scope != "" || *scopeFile != "" || *tokenAssociated || *newPass || *checkpoint != "") || *leadStart < 0 || *leadQueries < 1 || *leadPage < 1 || *leadPage > 10 || *leadPage > 1 && *leadQueries != 1 {
+		fmt.Fprintln(stderr, "kopis: search-leads requires GitHub without a scope or crawl checkpoint, and valid lead query bounds")
 		return 1
 	}
 	envName := *tokenEnv
@@ -267,7 +291,26 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		fmt.Fprintf(stderr, "kopis: repositories %d/%d complete\n", completed, total)
 	}
 	fmt.Fprintln(stderr, "kopis: preparing repository scope...")
-	result, err := kopis.Scan(ctx, request)
+	var result kopis.ScanResult
+	if *searchLeads {
+		leads := provider.github.SearchLeadsAt(ctx, request.Catalog, *leadStart, *leadQueries, *leadPage)
+		if ctx.Err() == nil {
+			if len(leads.Repositories) > 0 {
+				request.Repositories = leads.Repositories
+				request.Scope = kopis.Scope{Kind: kopis.ScopePublic}
+				result, err = kopis.Scan(ctx, request)
+			}
+			result.Leads = &kopis.LeadCoverage{QueriesPlanned: leads.QueriesPlanned, QueriesRun: leads.QueriesRun, NextQuery: leads.NextQuery, NextPage: leads.NextPage, RawMatches: leads.RawMatches, EligibleMatches: leads.EligibleMatches, FilteredMatches: leads.FilteredMatches, Saturated: leads.Saturated, Failures: leads.Failures}
+		}
+	} else if *scope == "" && *scopeFile == "" && !*tokenAssociated {
+		path := *checkpoint
+		if path == "" {
+			path = defaultCheckpointPath(*providerName, apiURL)
+		}
+		result, err = crawlPublic(ctx, request, provider, path, *batchSize, *newPass)
+	} else {
+		result, err = kopis.Scan(ctx, request)
+	}
 	if ctx.Err() != nil {
 		fmt.Fprintln(stderr, "kopis: scan canceled")
 		return 1
@@ -300,6 +343,16 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	if err != nil {
 		fmt.Fprintln(stderr, "kopis: output failed")
 		return 1
+	}
+	if result.Crawl != nil {
+		path := *checkpoint
+		if path == "" {
+			path = defaultCheckpointPath(*providerName, apiURL)
+		}
+		if err := acknowledgeCrawl(path, *providerName, apiURL, catalogIdentity(request.Catalog)); err != nil {
+			fmt.Fprintln(stderr, "kopis: checkpoint acknowledgement failed")
+			return 1
+		}
 	}
 	return kopis.ExitCode(result)
 }

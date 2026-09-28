@@ -131,6 +131,46 @@ func TestInspectionCredentialFormsLocationsSeverityAndExecution(t *testing.T) {
 	}
 }
 
+func TestInspectionDetectsNestedJSONCredentialAtValueLocation(t *testing.T) {
+	content := "{\"mcpServers\":{\"provider\":{\"api_key\":\"synthetic-secret-123\",\"env\":{\"access_token\":\"${TOKEN}\"}}}}"
+	findings := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: content})
+	if len(findings) != 1 || findings[0].Indicator != "api_key" || findings[0].Classification != ClassificationConfirmed {
+		t.Fatalf("nested JSON credential was not identified: %+v", findings)
+	}
+	f := findings[0]
+	if got := content[f.Location.StartByte:f.Location.EndByte]; got != "synthetic-secret-123" {
+		t.Fatalf("incorrect JSON source span: %q", got)
+	}
+}
+
+func TestInspectionJSONCTracksEscapedValuesAndIgnoresExampleText(t *testing.T) {
+	content := "// sample settings\n{\n  \"description\": \"api_key=synthetic-decoy-123\",\n  \"credentials\": {\n    \"api_key\": \"synthetic\\u002dvalue-456\" // attached comment\n  }\n}"
+	findings := Inspect(Candidate{Path: "opencode.jsonc", CatalogRule: "opencode.config", Content: content})
+	if len(findings) != 1 || findings[0].Fingerprint != fingerprint("synthetic-value-456") {
+		t.Fatalf("JSONC value was lost or description reported: %+v", findings)
+	}
+	f := findings[0]
+	if got := content[f.Location.StartByte:f.Location.EndByte]; got != `synthetic\u002dvalue-456` {
+		t.Fatalf("escaped value lost its source span: %q", got)
+	}
+}
+
+func TestInspectionJSONCAllowsTrailingCommas(t *testing.T) {
+	content := `{"config":{"api_key":"synthetic-value-789",},}`
+	findings := Inspect(Candidate{Path: "opencode.jsonc", CatalogRule: "opencode.config", Content: content})
+	if len(findings) != 1 || findings[0].Fingerprint != fingerprint("synthetic-value-789") {
+		t.Fatalf("trailing comma prevented structured inspection: %+v", findings)
+	}
+}
+
+func TestInspectionDoesNotSilentlyIgnoreLiteralContainingExample(t *testing.T) {
+	content := `{"api_key":"synthetic-example-value-456","fallback":"placeholder"}`
+	findings := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: content})
+	if len(findings) != 1 || findings[0].Fingerprint != fingerprint("synthetic-example-value-456") {
+		t.Fatalf("ordinary substring falsely excluded a credential-shaped value: %+v", findings)
+	}
+}
+
 func TestInspectionQuotedDefaultUsesLiteralLocationAndFingerprint(t *testing.T) {
 	content := `api_key="${TOKEN:-literal-secret}" api_key=${TOKEN:-literal-secret}`
 	findings := Inspect(Candidate{Path: "opencode.json", CatalogRule: "opencode.config", Content: content})

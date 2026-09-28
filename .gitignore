@@ -33,3 +33,6 @@ go.work.sum
 
 .ralph
 .opencode
+
+# Default local public-crawl checkpoints
+.kopis-crawl-*.json
