@@ -1,39 +1,29 @@
 # Kopis
 
-The name comes from the *kopis*, an ancient Greek curved sword.
+Kopis scans authorized GitHub and GitLab repositories for exposed credentials in AI-tool configuration and executable files. It inspects catalog-matched files on each repository's default branch; Markdown (`.md`, `.mdx`) is excluded.
 
-Kopis scans authorized GitHub or GitLab repositories for credential exposure in a catalog of AI-tool configuration and executable files. It lists each repository's default-branch files, matches catalog paths locally, and downloads only candidate files for inspection. Markdown (`.md` and `.mdx`) is excluded before retrieval, including referenced `{file:...}` targets. Content-gated workflow rules and eligible `{file:...}` targets are checked after their parent files are fetched.
+## Run
+
+Set `GITHUB_TOKEN` or `GITLAB_TOKEN`, then run:
 
 ```sh
-go run ./cmd/kopis -provider github -format jsonl
+# Scan a specific repository (including private repositories your token can access).
+go run ./cmd/kopis -provider github -scope owner/repo
 go run ./cmd/kopis -provider gitlab -scope group/project
-go run ./cmd/kopis -provider github -scope owner/repo -explain
-go run ./cmd/kopis -provider github -scope owner/repo -o report.txt
-go run ./cmd/kopis -provider github -scope owner/repo -format jsonl -o report.jsonl
-# Find likely AI-tool repositories quickly, then inspect each with the normal tree scan.
+
+# Crawl public repositories in batches; repeat with the same checkpoint.
+go run ./cmd/kopis -provider github -checkpoint ./github-crawl.json -format jsonl -o ./batch.jsonl
+
+# Find likely GitHub repositories quickly (incomplete coverage).
 go run ./cmd/kopis -provider github -search-leads -format jsonl
 ```
 
-Set `GITHUB_TOKEN` or `GITLAB_TOKEN` in the environment (or use `-token-env` to name another variable). With no scope, Kopis crawls **public** repositories on the selected provider instance in bounded batches. GitHub uses `/repositories` with a `since` ID; GitLab uses public-project keyset pagination on `-base-url` (GitLab.com by default). A GitLab.com scan does not cover other GitLab instances. To retain the earlier token-associated scan of owned, member, and collaborator repositories, pass `-token-associated`. Use `-scope` or `-scope-file` to scan specified repositories, including ones your token can access privately.
+Without `-scope`, `-scope-file`, or `-token-associated`, Kopis crawls public repositories on the selected provider instance (GitLab.com by default). Use `-token-associated` to scan repositories associated with your token instead. `-base-url` selects another provider instance; `-token-env` selects another token variable.
 
-```sh
-# Run repeatedly with the same checkpoint until coverage is complete.
-go run ./cmd/kopis -provider github -batch-size 100 -checkpoint ./github-crawl.json -format jsonl -o ./batch.jsonl
-go run ./cmd/kopis -provider gitlab -base-url https://gitlab.com -batch-size 100 -checkpoint ./gitlab-crawl.json
-# Once a pass is complete, start a pass for repositories created afterward.
-go run ./cmd/kopis -provider github -checkpoint ./github-crawl.json -new-pass
-# The previous token-associated default is still available explicitly.
-go run ./cmd/kopis -provider github -token-associated
-```
+## Coverage and output
 
-The default checkpoint filename is derived from the provider and instance URL. Keep the same checkpoint across runs; `-new-pass` requires the preceding pass to be complete. Batch reports contain findings **from that run** (plus any undelivered findings from a failed report write), cumulative crawl counts, and exhausted repository IDs in `crawl.gap_repositories`; retain each batch report if you need a combined findings history. `-o` replaces its destination, so use distinct filenames for retained batches. Checkpoints store public repository identities, progress, and redacted outcomes awaiting a successful report write, not tokens or fetched content. An interrupted run may replay its last uncommitted repository or undelivered report, but will not skip it.
+Keep the same checkpoint across public crawl batches. Each report contains that run's findings, so use a different `-o` file for each batch (`-o` overwrites). After a completed pass, use `-new-pass` to look for newer repositories. Use a fresh checkpoint to revisit exhausted gaps or rescan after detector changes. Exit code 2 means coverage is incomplete; failed repositories remain identified as gaps. Kopis does not scan history or perform comprehensive secret detection.
 
-Coverage remains incomplete (exit code 2) until enumeration ends and outstanding repository retries are resolved. Partial or inaccessible repositories are retried in later runs up to three attempts, then remain identified coverage gaps and keep the pass incomplete. To revisit exhausted gaps, start a fresh checkpoint and rescan the public range. Completion describes the enumerated public repository range and catalogued **default-branch** files; it is not a snapshot across simultaneous repository visibility changes. GitHub records its end ID on reaching the end of pagination; GitLab records a public-project upper ID at pass start. New repositories require another pass. Tree truncation, pagination errors, and failed candidate retrieval remain coverage gaps. Kopis does not scan history or perform comprehensive secret detection.
+`-search-leads` uses GitHub's **legacy REST code search** (`/search/code`) to select repositories for the normal scan. Its queries use `filename:` for filenames; GitHub's newer **website** Code Search uses `path:` instead. Lead search is indexed and capped, never establishes complete coverage, and does not advance the crawl checkpoint. By default it runs one query and one page; use `-lead-start N`, `-lead-queries N`, or `-lead-page N` to request more results. Exit code 2 is expected.
 
-`-search-leads` is a separate GitHub-only, findings-first mode. It runs catalog-derived legacy code-search queries to identify likely repositories, filters paths locally, and then uses the same default-branch inventory and candidate inspection as the crawl. By default it requests one query and one page (at most 100 search matches). The JSONL `leads` section reports raw/eligible/filtered matches, `queries_planned`, `next_query`, `next_page`, and saturated queries; use `-lead-start N` for another query and `-lead-page N` for another page of a single query (up to page 10). `-lead-queries N` runs adjacent queries in one invocation. Search results can be capped, outdated, or absent from GitHub's index, so lead-mode coverage always remains incomplete. The lead run does not advance the crawl checkpoint, and its exit code 2 is expected. Only the crawl establishes the repository enumeration boundary.
-
-Inspection now uses JSON/JSONC values, parsed workflow steps, TOML configuration, and dotenv assignments according to their file roles. Markdown files are not scanned; JavaScript/TypeScript comments, environment and CI secret references, and credentials in loopback URLs (`localhost`, `.localhost`, and loopback IP addresses) are excluded from confirmed findings. Malformed JSON documents do not fall back to broad assignment scanning. Detector changes invalidate earlier crawl checkpoints: use a new checkpoint filename to rescan repositories under these rules. Unknown host-specific configuration fields and indirect executable flows still require manual review.
-
-Use `-explain` to see content-free repository listing counts and the catalog paths matched, fetched, inspected, or failed on standard error. It helps distinguish discovery and retrieval gaps from inspection gaps. `findings` means the scan reported credential evidence; `no_findings` means a catalogued file was inspected without a reported finding, not that the repository is free of secrets. Findings report source locations and fingerprints without printing matched credential values.
-
-Terminal output groups repeated findings by file and type, showing all source locations with shared guidance once. JSONL keeps each occurrence as a separate finding. By default the report goes to standard output; `-o` writes the selected format to a file and replaces an existing report. Progress and `-explain` details remain on standard error.
+Reports go to standard output by default (`-format jsonl` for JSONL); `-o` writes to a file. Use `-explain` to see discovery and retrieval counts on standard error. Findings include source locations and fingerprints, not credential values. `no_findings` means inspected files had no reported finding, not that the repository is safe.
