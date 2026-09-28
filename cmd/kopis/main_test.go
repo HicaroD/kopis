@@ -110,6 +110,44 @@ func TestChangedInspectorDoesNotResumeEarlierCoverageCheckpoint(t *testing.T) {
 	}
 }
 
+func TestFormatAwareInspectorInvalidatesPreviousCheckpoint(t *testing.T) {
+	catalog, err := json.Marshal(kopis.InitialCatalog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := sha256.Sum256(append([]byte("json-structured-v2:"), catalog...))
+	path := filepath.Join(t.TempDir(), "previous.json")
+	data, err := json.Marshal(crawlCheckpoint{Version: checkpointVersion, Provider: "github", Instance: "https://api.github.com", Catalog: fmt.Sprintf("%x", previous)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCrawl(path, "github", "https://api.github.com", catalogIdentity(kopis.InitialCatalog())); err == nil {
+		t.Fatal("old detector checkpoint would skip format-aware reinspection")
+	}
+}
+
+func TestLoopbackClassificationInvalidatesPreviousCheckpoint(t *testing.T) {
+	catalog, err := json.Marshal(kopis.InitialCatalog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := sha256.Sum256(append([]byte("format-aware-v3:"), catalog...))
+	path := filepath.Join(t.TempDir(), "previous.json")
+	data, err := json.Marshal(crawlCheckpoint{Version: checkpointVersion, Provider: "github", Instance: "https://api.github.com", Catalog: fmt.Sprintf("%x", previous)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCrawl(path, "github", "https://api.github.com", catalogIdentity(kopis.InitialCatalog())); err == nil {
+		t.Fatal("previous detector checkpoint would retain outdated loopback findings")
+	}
+}
+
 func TestGitHubSearchLeadsRunsNormalRepositoryScanAndReportsIncompleteCoverage(t *testing.T) {
 	var unexpected []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -900,7 +938,7 @@ func (s *runtimeJourneyServer) github(w http.ResponseWriter, r *http.Request) {
 		s.queries = append(s.queries, "team/complete blob")
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"encoding": "base64",
-			"content":  base64.StdEncoding.EncodeToString([]byte("api_key=literal-secret")),
+			"content":  base64.StdEncoding.EncodeToString([]byte(`api_key="literal-secret"`)),
 		})
 		return
 	}
@@ -939,7 +977,7 @@ func (s *runtimeJourneyServer) gitlab(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.Contains(r.URL.Path, "/repository/files/") && strings.HasSuffix(r.URL.Path, "/raw") {
 		s.queries = append(s.queries, "team/complete "+strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v4/projects/team/complete/repository/files/"), "/raw"))
-		_, _ = w.Write([]byte("api_key=literal-secret"))
+		_, _ = w.Write([]byte(`api_key="literal-secret"`))
 		return
 	}
 	s.invalidRequest = r.URL.Path

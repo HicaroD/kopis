@@ -53,6 +53,26 @@ func TestGitHubLeadSearchFiltersDynamicPathsLocally(t *testing.T) {
 	}
 }
 
+func TestGitHubLeadSearchSkipsMarkdownOnlyRepositories(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 3, "items": []any{
+			map[string]any{"path": ".agents/skills/demo/SKILL.md", "repository": map[string]any{"full_name": "public/docs"}},
+			map[string]any{"path": ".agents/skills/demo/reference.MDX", "repository": map[string]any{"full_name": "public/docs"}},
+			map[string]any{"path": ".agents/skills/demo/scripts/check.ts", "repository": map[string]any{"full_name": "public/code"}},
+		}})
+	}))
+	defer server.Close()
+	client, err := NewGitHubClient(GitHubConfig{BaseURL: server.URL, Token: "token", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := []Artifact{{Rule: CatalogRule{ID: "antigravity.skills", Tool: ToolAntigravity}}}
+	result := client.SearchLeads(context.Background(), catalog, 0, 1)
+	if len(result.Repositories) != 1 || result.Repositories[0].ID != "public/code" || result.FilteredMatches != 2 {
+		t.Fatalf("Markdown led to a repository scan: %+v", result)
+	}
+}
+
 func TestGitHubLeadSearchMarksCappedQueryAndRespectsCatalog(t *testing.T) {
 	var query string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

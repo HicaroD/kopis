@@ -78,6 +78,36 @@ func TestScanListsPathsAndFetchesOnlyCatalogCandidates(t *testing.T) {
 	}
 }
 
+func TestScanNeverFetchesMarkdownIncludingFileSubstitutions(t *testing.T) {
+	provider := &scanProvider{repositories: []Repository{{Provider: GitHubProvider, ID: "team/repo", Owner: true, Accessible: true}},
+		listing: FileListing{Complete: true, Files: []RepositoryFile{
+			{Path: "opencode.json", Revision: "config"},
+			{Path: "docs/credential.md", Revision: "doc"},
+			{Path: "secrets.txt", Revision: "secret"},
+			{Path: ".agents/skills/demo/SKILL.md", Revision: "skill"},
+			{Path: ".agents/skills/demo/scripts/check.ts", Revision: "script"},
+			{Path: ".gemini/skills/demo/SKILL.md", Revision: "gemini"},
+			{Path: ".agents/rules/security.md", Revision: "rule"},
+		}}, contents: map[string]string{
+			"opencode.json":                        `{"instructions":["{file:docs/credential.md}","{file:secrets.txt}"]}`,
+			"docs/credential.md":                   "api_key=synthetic-example-123",
+			"secrets.txt":                          "api_key=synthetic-live-key-123",
+			".agents/skills/demo/scripts/check.ts": "const apiKey = 'synthetic-script-key-123';",
+		}}
+	result, err := Scan(context.Background(), ScanRequest{Provider: GitHubProvider, Token: "token", Scanner: provider, Catalog: InitialCatalog()})
+	if err != nil || len(result.Findings) != 3 {
+		t.Fatalf("expected the text target and script findings: result=%+v err=%v", result, err)
+	}
+	for _, p := range provider.fetched {
+		if strings.HasSuffix(p, ".md") {
+			t.Fatalf("Markdown was fetched: %v", provider.fetched)
+		}
+	}
+	if len(provider.fetched) != 3 {
+		t.Fatalf("expected only config, text target, and script: %v", provider.fetched)
+	}
+}
+
 func TestScanContentGatesAndFollowsOnlyListedSubstitutions(t *testing.T) {
 	provider := &scanProvider{repositories: []Repository{{Provider: GitHubProvider, ID: "team/repo", Owner: true, Accessible: true}},
 		listing: FileListing{Complete: true, Files: []RepositoryFile{

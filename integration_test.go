@@ -243,8 +243,227 @@ func TestInspectionDistinguishesEnvironmentReferenceFromLiteralAccessToken(t *te
 	content := "const accessToken = process.env.MAPS_ACCESS_TOKEN;\n" +
 		"const otherToken = import.meta.env.VITE_API_TOKEN;\n" +
 		"const accessToken = 'synthetic-literal-token-123';"
-	findings := Inspect(Candidate{Path: ".gemini/skills/remotion-best-practices/rules/maps.md", CatalogRule: "gemini.skills", Content: content})
+	findings := Inspect(Candidate{Path: ".opencode/tools/maps.ts", CatalogRule: "opencode.tool", Content: content})
 	if len(findings) != 1 || findings[0].Fingerprint != fingerprint("synthetic-literal-token-123") || findings[0].Indicator != "access_token" {
 		t.Fatalf("environment reference reported or literal token missed: %+v", findings)
+	}
+}
+
+func TestStructuredConfigIgnoresProseAndReferenceNamesButFindsCredentialValues(t *testing.T) {
+	cases := []struct {
+		path, rule, content, want string
+	}{
+		{"opencode.json", "opencode.config", `{"description":"Bearer synthetic-documentation-123","provider":{"sample":{"options":{"apiKey":"{env:KEY}"}},"real":{"options":{"apiKey":"synthetic-live-key-123"}}}}`, "synthetic-live-key-123"},
+		{".mcp.json", "claude.mcp", `{"mcpServers":{"demo":{"command":"api_key=synthetic-example-123","env":{"API_KEY":"${API_KEY}"}},"real":{"type":"http","url":"https://example.test","headers":{"Authorization":"Bearer synthetic-live-token-123"}}}}`, "Bearer synthetic-live-token-123"},
+		{".claude/settings.json", "claude.settings", `{"permissions":{"deny":["Bash(api_key=synthetic-example-123 *)"],"allow":["Bash(PGPASSWORD=synthetic-live-pass-123 psql:*)"]},"env":{"API_KEY":"${API_KEY}"}}`, "synthetic-live-pass-123"},
+		{"gemini-extension.json", "gemini.extension", `{"description":"Bearer synthetic-example-123","settings":[{"envVar":"SYNTHETIC_API_KEY","sensitive":true}],"mcpServers":{"real":{"env":{"API_KEY":"synthetic-live-key-123"}}}}`, "synthetic-live-key-123"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.rule, func(t *testing.T) {
+			findings := Inspect(Candidate{Path: tc.path, CatalogRule: tc.rule, Content: tc.content})
+			if len(findings) != 1 || findings[0].Fingerprint != fingerprint(tc.want) {
+				t.Fatalf("expected only credential-bearing value: %+v", findings)
+			}
+		})
+	}
+}
+
+func TestMalformedStructuredConfigDoesNotBecomeConfirmedAssignment(t *testing.T) {
+	findings := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: `{"description":"api_key=synthetic-example-123",`})
+	if len(findings) != 0 {
+		t.Fatalf("invalid JSON became a confirmed credential: %+v", findings)
+	}
+}
+
+func TestJSONCSubstitutionOnlyFollowsActualValuesAndContainedPaths(t *testing.T) {
+	files := map[string]string{
+		"opencode.jsonc": `// {file:decoy.txt}
+{"instructions":["{file:./included.txt}","{file:../outside.txt}","{file:/absolute.txt}"],"description":"{file:decoy.txt}"}`,
+		"included.txt": "api_key=synthetic-value-123", "decoy.txt": "", "../outside.txt": "", "/absolute.txt": "",
+	}
+	artifacts := RecognizeArtifact("opencode.jsonc", files)
+	if len(artifacts) != 2 || artifacts[1].Path != "included.txt" {
+		t.Fatalf("followed a comment, prose, or out-of-repository reference: %+v", artifacts)
+	}
+}
+
+func TestCredentialKeyDoesNotMatchUnrelatedWords(t *testing.T) {
+	findings := Inspect(Candidate{Path: ".codex/config.toml", CatalogRule: "codex.config", Content: "author = 'synthetic-person-123'\nauth_token = 'synthetic-token-123'\n"})
+	if len(findings) != 1 || findings[0].Fingerprint != fingerprint("synthetic-token-123") {
+		t.Fatalf("word fragment was treated as an auth key: %+v", findings)
+	}
+}
+
+func TestWorkflowRequiresActionStepAndInspectsOnlyCredentialInputs(t *testing.T) {
+	path := ".github/workflows/ai.yml"
+	comment := "# uses: openai/codex-action@v1\nname: demo\njobs: {test: {runs-on: ubuntu-latest, steps: [{run: 'api_key=synthetic-example-123'}]}}\n"
+	if got := RecognizeArtifact(path, map[string]string{path: comment}); len(got) != 0 {
+		t.Fatalf("workflow action in a comment was admitted: %+v", got)
+	}
+	content := `jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: openai/codex-action@v1
+        with:
+          prompt: 'api_key=synthetic-example-123'
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+      - uses: openai/codex-action@v1
+        with:
+          openai-api-key: synthetic-live-key-123
+`
+	if got := RecognizeArtifact(path, map[string]string{path: content}); len(got) != 1 || got[0].Rule.ID != "codex.workflow" {
+		t.Fatalf("actual workflow action not admitted: %+v", got)
+	}
+	findings := Inspect(Candidate{Path: path, CatalogRule: "codex.workflow", Content: content})
+	if len(findings) != 1 || findings[0].Fingerprint != fingerprint("synthetic-live-key-123") {
+		t.Fatalf("workflow prompt or secret reference reported, or literal missed: %+v", findings)
+	}
+}
+
+func TestTOMLCommandsAndProviderNamesDoNotBecomeCredentials(t *testing.T) {
+	command := "description = 'api_key=synthetic-example-123'\nprompt = '''Use token=synthetic-example-456 in a sample.'''\n"
+	if got := Inspect(Candidate{Path: ".gemini/commands/help.toml", CatalogRule: "gemini.commands", Content: command}); len(got) != 0 {
+		t.Fatalf("prompt prose reported as credential: %+v", got)
+	}
+	config := "[model_providers.example]\nenv_key = 'SYNTHETIC_API_KEY'\n[model_providers.example.env]\nAPI_KEY = 'synthetic-live-key-123'\n"
+	got := Inspect(Candidate{Path: ".codex/config.toml", CatalogRule: "codex.config", Content: config})
+	if len(got) != 1 || got[0].Fingerprint != fingerprint("synthetic-live-key-123") {
+		t.Fatalf("provider variable name reported or env literal missed: %+v", got)
+	}
+}
+
+func TestExtensionDotenvDistinguishesCommentsReferencesAndLiterals(t *testing.T) {
+	content := "# API_KEY=synthetic-example-123\nAPI_KEY=${API_KEY}\nexport ACCESS_TOKEN='synthetic-live-token-123' # inline\n"
+	got := Inspect(Candidate{Path: "extension/.env", CatalogRule: "gemini.extension-env", Content: content})
+	if len(got) != 1 || got[0].Fingerprint != fingerprint("synthetic-live-token-123") {
+		t.Fatalf("dotenv comment or reference reported, or literal missed: %+v", got)
+	}
+}
+
+func TestSkillProseAndToolDocumentationAreNotExecutableCredentials(t *testing.T) {
+	content := "# Example\n```sh\napi_key=synthetic-example-123\ncurl https://example.test\n```\n"
+	for _, tc := range []struct{ path, rule string }{
+		{".agents/skills/demo/SKILL.md", "gemini.skills"},
+		{".agents/rules/demo.md", "antigravity.rules"},
+		{".opencode/tools/README.md", "opencode.tool"},
+		{"extension/skills/demo/SKILL.md", "gemini.extension-assets"},
+	} {
+		if findings := Inspect(Candidate{Path: tc.path, CatalogRule: tc.rule, Content: content}); len(findings) != 0 {
+			t.Errorf("%s prose reported as executable exposure: %+v", tc.path, findings)
+		}
+	}
+}
+
+func TestJSONRemoteURLDetectsPasswordButNotDocumentationURL(t *testing.T) {
+	content := `{"description":"https://sample:example-password@example.test/docs","mcpServers":{"remote":{"type":"http","url":"https://user:synthetic-live-pass-123@mcp.test/api"}}}`
+	got := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: content})
+	if len(got) != 1 || got[0].Fingerprint != fingerprint("synthetic-live-pass-123") {
+		t.Fatalf("MCP URL password missed or description URL reported: %+v", got)
+	}
+}
+
+func TestPluginCommentsAreNotCredentialsOrExecutableBehavior(t *testing.T) {
+	content := "// api_key=synthetic-example-123\n/* curl https://example.test with token=synthetic-example-456 */\n" +
+		"const endpoint = 'https://example.test';\nconst apiKey = 'synthetic-live-key-123';\n"
+	got := Inspect(Candidate{Path: ".opencode/plugins/custom.ts", CatalogRule: "opencode.plugin", Content: content})
+	if len(got) != 1 || got[0].Fingerprint != fingerprint("synthetic-live-key-123") {
+		t.Fatalf("plugin comments reported or literal missed: %+v", got)
+	}
+}
+
+func TestStructuredInterpolatedHeaderIsNotConfirmedLiteral(t *testing.T) {
+	content := `{"mcpServers":{"remote":{"type":"http","url":"https://mcp.test","headers":{"Authorization":"Bearer ${API_TOKEN}"}}}}`
+	if got := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: content}); len(got) != 0 {
+		t.Fatalf("runtime interpolation treated as committed credential: %+v", got)
+	}
+}
+
+func TestWorkflowJobEnvironmentCredentialIsInspected(t *testing.T) {
+	content := `jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: synthetic-job-key-123
+    steps:
+      - uses: anomalyco/opencode/github@v1
+        with:
+          prompt: 'Explain API_KEY=synthetic-example-123'
+`
+	got := Inspect(Candidate{Path: ".github/workflows/opencode.yaml", CatalogRule: "opencode.workflow", Content: content})
+	if len(got) != 1 || got[0].Fingerprint != fingerprint("synthetic-job-key-123") {
+		t.Fatalf("job environment literal missed or prompt reported: %+v", got)
+	}
+}
+
+func TestOpenCodeToolDirectoryOnlyAdmitsToolModules(t *testing.T) {
+	files := map[string]string{".opencode/tools/README.md": "api_key=synthetic-example-123", ".opencode/tools/deploy.ts": "export default {}"}
+	if got := RecognizeArtifact(".opencode/tools/README.md", files); len(got) != 0 {
+		t.Fatalf("documentation was admitted as a custom tool: %+v", got)
+	}
+	if got := RecognizeArtifact(".opencode/tools/deploy.ts", files); len(got) != 1 || got[0].Rule.ID != "opencode.tool" {
+		t.Fatalf("custom tool module was missed: %+v", got)
+	}
+}
+
+func TestMCPServerArgsDatabasePasswordIsNotLost(t *testing.T) {
+	content := `{"mcpServers":{"remote":{"command":"npx","args":["server","postgresql://user:synthetic-db-pass-123@db.example.test:5432/app"]}}}`
+	got := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: content})
+	if len(got) != 1 || got[0].Fingerprint != fingerprint("synthetic-db-pass-123") || got[0].Indicator != "password" {
+		t.Fatalf("literal password in MCP args missed: %+v", got)
+	}
+}
+
+func TestLoopbackDatabaseCredentialsAreNotConfirmedExposures(t *testing.T) {
+	for _, address := range []string{"localhost:8432", "127.0.0.1:5432", "[::1]:5432"} {
+		content := `{"mcpServers":{"local":{"command":"npx","args":["postgresql://user:synthetic-dev-pass-123@` + address + `/app"]}}}`
+		if got := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: content}); len(got) != 0 {
+			t.Errorf("loopback example marked exposed (%s): %+v", address, got)
+		}
+	}
+	remote := `{"mcpServers":{"remote":{"args":["postgresql://user:synthetic-real-pass-123@db.example.test/app"]}}}`
+	got := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: remote})
+	if len(got) != 1 || got[0].Fingerprint != fingerprint("synthetic-real-pass-123") {
+		t.Fatalf("non-loopback password missed: %+v", got)
+	}
+}
+
+func TestLoopbackSuppressionAlsoAppliesOutsideMCPArgs(t *testing.T) {
+	for _, content := range []string{
+		`database_url="postgresql://user:synthetic-dev-pass-123@localhost/app"`,
+		`endpoint="https://user:synthetic-dev-pass-123@127.0.0.1/api"`,
+		`{"mcpServers":{"local":{"type":"http","url":"https://user:synthetic-dev-pass-123@localhost/api"}}}`,
+	} {
+		if got := Inspect(Candidate{Path: ".mcp.json", CatalogRule: "claude.mcp", Content: content}); len(got) != 0 {
+			t.Errorf("loopback URL reported: %+v", got)
+		}
+	}
+}
+
+func TestCatalogExcludesMarkdownButAdmitsAdjacentExecutableAssets(t *testing.T) {
+	files := map[string]string{
+		"extension/gemini-extension.json":     "{}",
+		"extension/skills/demo/SKILL.md":      "api_key=synthetic-example-123",
+		"extension/skills/demo/reference.MDX": "api_key=synthetic-example-123",
+		"extension/hooks/check.sh":            "api_key=synthetic-live-key-123",
+		".agents/skills/demo/SKILL.md":        "",
+		".agents/rules/demo.md":               "",
+		".gemini/skills/demo/SKILL.md":        "",
+	}
+	for filename := range files {
+		if (strings.HasSuffix(strings.ToLower(filename), ".md") || strings.HasSuffix(strings.ToLower(filename), ".mdx")) && len(RecognizeArtifact(filename, files)) != 0 {
+			t.Errorf("Markdown admitted: %s", filename)
+		}
+	}
+	if got := RecognizeArtifact("extension/hooks/check.sh", files); len(got) != 1 || got[0].Rule.ID != "gemini.extension-assets" {
+		t.Fatalf("neighboring script lost: %+v", got)
+	}
+}
+
+func TestDirectInspectionAlsoExcludesMarkdown(t *testing.T) {
+	for _, path := range []string{".agents/skills/demo/SKILL.md", "extension/skills/demo/reference.MDX"} {
+		if got := Inspect(Candidate{Path: path, CatalogRule: "gemini.skills", Content: "api_key=synthetic-live-key-123"}); len(got) != 0 {
+			t.Fatalf("Markdown should not be inspected even as a direct candidate: %s %+v", path, got)
+		}
 	}
 }

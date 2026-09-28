@@ -18,7 +18,7 @@ import (
 
 const checkpointVersion = 1
 const maxCrawlAttempts = 3
-const inspectionVersion = "json-structured-v2"
+const inspectionVersion = "format-aware-v4"
 
 type crawlItem struct {
 	ID         int64            `json:"id"`

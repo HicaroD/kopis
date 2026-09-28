@@ -1,6 +1,7 @@
 package kopis
 
 import (
+	"encoding/json"
 	"path"
 	"sort"
 	"strings"
@@ -47,12 +48,12 @@ func InitialCatalog() []Artifact {
 		{".github/workflows/codex.yml", "codex.workflow", ToolCodex, "workflow using openai/codex-action", "workflow_provider_key"},
 		{".agents/mcp_config.json", "antigravity.mcp", ToolAntigravity, "Antigravity MCP configuration", "credential_fields"},
 		{".agents/hooks.json", "antigravity.hooks", ToolAntigravity, "Antigravity hooks", "executable"},
-		{".agents/skills/index.md", "antigravity.skills", ToolAntigravity, "Antigravity skills", "executable"},
-		{".agents/rules/index.md", "antigravity.rules", ToolAntigravity, "Antigravity rules", "executable"},
+		{".agents/skills/example/scripts/check.ts", "antigravity.skills", ToolAntigravity, "Antigravity skill assets", "executable"},
+		{".agents/rules/check.js", "antigravity.rules", ToolAntigravity, "Antigravity rule assets", "executable"},
 		{".gemini/settings.json", "gemini.settings", ToolGeminiCLI, "Gemini CLI settings", "credential_fields"},
 		{".gemini/commands/default.toml", "gemini.commands", ToolGeminiCLI, "Gemini CLI commands", "executable"},
 		{"gemini-extension.json", "gemini.extension", ToolGeminiCLI, "Gemini extension manifest", "credential_fields"},
-		{".gemini/skills/index.md", "gemini.skills", ToolGeminiCLI, "Gemini CLI skills", "executable"},
+		{".gemini/skills/example/scripts/check.ts", "gemini.skills", ToolGeminiCLI, "Gemini CLI skill assets", "executable"},
 	}
 	result := make([]Artifact, 0, len(entries))
 	for _, entry := range entries {
@@ -124,6 +125,9 @@ func catalogAllows(catalog []Artifact, id string) bool {
 }
 
 func catalogAllowsArtifact(catalog []Artifact, candidate Artifact) bool {
+	if isMarkdownPath(candidate.Path) {
+		return false
+	}
 	if !catalogAllows(catalog, candidate.Rule.ID) {
 		return false
 	}
@@ -146,15 +150,18 @@ func RecognizeArtifact(filename string, files map[string]string) []Artifact {
 
 func catalogMatches(filename, content string, files map[string]string) []Artifact {
 	p := slashPath(filename)
+	if isMarkdownPath(p) {
+		return nil
+	}
 	var rules []CatalogRule
 	switch {
 	case p == "opencode.json" || p == "opencode.jsonc":
 		rules = append(rules, rule("opencode.config", ToolOpenCode, "project-root opencode configuration", "credential_fields"))
 	case strings.HasPrefix(p, ".opencode/plugins/") && hasExtension(p, ".js", ".jsx", ".ts", ".tsx"):
 		rules = append(rules, rule("opencode.plugin", ToolOpenCode, "OpenCode plugin", "executable"))
-	case strings.HasPrefix(p, ".opencode/tools/"):
+	case strings.HasPrefix(p, ".opencode/tools/") && hasExtension(p, ".js", ".jsx", ".ts", ".tsx"):
 		rules = append(rules, rule("opencode.tool", ToolOpenCode, "OpenCode custom tool", "executable"))
-	case strings.HasPrefix(p, ".github/workflows/") && (strings.HasSuffix(p, ".yml") || strings.HasSuffix(p, ".yaml")) && strings.Contains(content, "anomalyco/opencode/github"):
+	case strings.HasPrefix(p, ".github/workflows/") && hasExtension(p, ".yml", ".yaml") && workflowAction(content, "anomalyco/opencode/github"):
 		rules = append(rules, rule("opencode.workflow", ToolOpenCode, "workflow using anomalyco/opencode/github", "workflow_provider_key"))
 	case p == ".mcp.json":
 		rules = append(rules, rule("claude.mcp", ToolClaudeCode, "project-root Claude MCP configuration", "credential_fields"))
@@ -164,7 +171,7 @@ func catalogMatches(filename, content string, files map[string]string) []Artifac
 		rules = append(rules, rule("claude.plugin-mcp", ToolClaudeCode, "Claude plugin MCP configuration", "credential_fields"))
 	case strings.HasSuffix(p, "/.codex/config.toml") || p == ".codex/config.toml":
 		rules = append(rules, rule("codex.config", ToolCodex, "Codex configuration", "credential_fields"))
-	case strings.HasPrefix(p, ".github/workflows/") && (strings.HasSuffix(p, ".yml") || strings.HasSuffix(p, ".yaml")) && strings.Contains(content, "openai/codex-action"):
+	case strings.HasPrefix(p, ".github/workflows/") && hasExtension(p, ".yml", ".yaml") && workflowAction(content, "openai/codex-action"):
 		rules = append(rules, rule("codex.workflow", ToolCodex, "workflow using openai/codex-action", "workflow_provider_key"))
 	case p == ".agents/mcp_config.json":
 		rules = append(rules, rule("antigravity.mcp", ToolAntigravity, "Antigravity MCP configuration", "credential_fields"))
@@ -200,7 +207,7 @@ func catalogMatches(filename, content string, files map[string]string) []Artifac
 	}
 	if p == "opencode.json" || p == "opencode.jsonc" {
 		for _, referenced := range fileSubstitutions(content) {
-			if _, ok := files[referenced]; ok {
+			if _, ok := files[referenced]; ok && !isMarkdownPath(referenced) {
 				result = append(result, Artifact{Path: referenced, Rule: rule("opencode.file-substitution", ToolOpenCode, "repository-relative {file:...} target", "credential_fields")})
 			}
 		}
@@ -223,6 +230,11 @@ func rule(id, tool, pattern, indicator string) CatalogRule {
 }
 
 func slashPath(s string) string { return strings.TrimPrefix(strings.ReplaceAll(s, "\\", "/"), "./") }
+
+func isMarkdownPath(s string) bool {
+	extension := path.Ext(slashPath(s))
+	return strings.EqualFold(extension, ".md") || strings.EqualFold(extension, ".mdx")
+}
 
 func hasExtension(s string, extensions ...string) bool {
 	for _, extension := range extensions {
@@ -249,6 +261,36 @@ func extensionRootExists(p string, files map[string]string) bool {
 }
 
 func fileSubstitutions(content string) []string {
+	// Substitutions only exist in configuration values, not comments or keys.
+	source := stripJSONComments(content)
+	var config any
+	if json.Unmarshal([]byte(source), &config) != nil {
+		return nil
+	}
+	var result []string
+	var walk func(any)
+	walk = func(value any) {
+		switch value := value.(type) {
+		case map[string]any:
+			for key, child := range value {
+				if key != "description" {
+					walk(child)
+				}
+			}
+		case []any:
+			for _, child := range value {
+				walk(child)
+			}
+		case string:
+			result = append(result, validFileSubstitutions(value)...)
+		}
+	}
+	walk(config)
+	sort.Strings(result)
+	return result
+}
+
+func validFileSubstitutions(content string) []string {
 	const marker = "{file:"
 	var result []string
 	for start := 0; ; {
@@ -259,7 +301,13 @@ func fileSubstitutions(content string) []string {
 		i += start
 		end := strings.IndexByte(content[i+len(marker):], '}')
 		if end >= 0 {
-			result = append(result, slashPath(content[i+len(marker):i+len(marker)+end]))
+			reference := strings.TrimSpace(content[i+len(marker) : i+len(marker)+end])
+			if reference != "" && !strings.HasPrefix(reference, "~") && !path.IsAbs(reference) {
+				clean := path.Clean(slashPath(reference))
+				if clean != "." && clean != ".." && !strings.HasPrefix(clean, "../") {
+					result = append(result, clean)
+				}
+			}
 		}
 		start = i + len(marker)
 	}

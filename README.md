@@ -2,7 +2,7 @@
 
 The name comes from the *kopis*, an ancient Greek curved sword.
 
-Kopis scans authorized GitHub or GitLab repositories for credential exposure in a catalog of AI-tool configuration and executable files. It lists each repository's default-branch files, matches catalog paths locally, and downloads only candidate files for inspection. Content-gated workflow rules and referenced `{file:...}` targets are checked after their parent files are fetched.
+Kopis scans authorized GitHub or GitLab repositories for credential exposure in a catalog of AI-tool configuration and executable files. It lists each repository's default-branch files, matches catalog paths locally, and downloads only candidate files for inspection. Markdown (`.md` and `.mdx`) is excluded before retrieval, including referenced `{file:...}` targets. Content-gated workflow rules and eligible `{file:...}` targets are checked after their parent files are fetched.
 
 ```sh
 go run ./cmd/kopis -provider github -format jsonl
@@ -32,7 +32,7 @@ Coverage remains incomplete (exit code 2) until enumeration ends and outstanding
 
 `-search-leads` is a separate GitHub-only, findings-first mode. It runs catalog-derived legacy code-search queries to identify likely repositories, filters paths locally, and then uses the same default-branch inventory and candidate inspection as the crawl. By default it requests one query and one page (at most 100 search matches). The JSONL `leads` section reports raw/eligible/filtered matches, `queries_planned`, `next_query`, `next_page`, and saturated queries; use `-lead-start N` for another query and `-lead-page N` for another page of a single query (up to page 10). `-lead-queries N` runs adjacent queries in one invocation. Search results can be capped, outdated, or absent from GitHub's index, so lead-mode coverage always remains incomplete. The lead run does not advance the crawl checkpoint, and its exit code 2 is expected. Only the crawl establishes the repository enumeration boundary.
 
-The JSON/JSONC inspector walks configuration values (including nested properties and JSONC comments/trailing commas) while preserving file locations. Earlier crawl checkpoints are rejected after this detector change: use a new checkpoint filename to rescan repositories that might have been missed by the former JSON assignment matcher.
+Inspection now uses JSON/JSONC values, parsed workflow steps, TOML configuration, and dotenv assignments according to their file roles. Markdown files are not scanned; JavaScript/TypeScript comments, environment and CI secret references, and credentials in loopback URLs (`localhost`, `.localhost`, and loopback IP addresses) are excluded from confirmed findings. Malformed JSON documents do not fall back to broad assignment scanning. Detector changes invalidate earlier crawl checkpoints: use a new checkpoint filename to rescan repositories under these rules. Unknown host-specific configuration fields and indirect executable flows still require manual review.
 
 Use `-explain` to see content-free repository listing counts and the catalog paths matched, fetched, inspected, or failed on standard error. It helps distinguish discovery and retrieval gaps from inspection gaps. `findings` means the scan reported credential evidence; `no_findings` means a catalogued file was inspected without a reported finding, not that the repository is free of secrets. Findings report source locations and fingerprints without printing matched credential values.
 

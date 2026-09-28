@@ -31,7 +31,9 @@ func githubCatalogLeadQueries(catalog []Artifact) []githubLeadQuery {
 	var queries []githubLeadQuery
 	add := func(ruleID, query string, match func(string) bool) {
 		if catalogAllows(catalog, ruleID) {
-			queries = append(queries, githubLeadQuery{text: query, match: match})
+			queries = append(queries, githubLeadQuery{text: query, match: func(path string) bool {
+				return !isMarkdownPath(path) && match(path)
+			}})
 		}
 	}
 	exact := func(expected string) func(string) bool { return func(path string) bool { return path == expected } }
@@ -52,7 +54,9 @@ func githubCatalogLeadQueries(catalog []Artifact) []githubLeadQuery {
 	add("opencode.plugin", "opencode in:path path:.opencode/plugins", func(p string) bool {
 		return strings.HasPrefix(p, ".opencode/plugins/") && hasExtension(p, ".js", ".jsx", ".ts", ".tsx")
 	})
-	add("opencode.tool", "opencode in:path path:.opencode/tools", under(".opencode/tools/"))
+	add("opencode.tool", "opencode in:path path:.opencode/tools", func(p string) bool {
+		return strings.HasPrefix(p, ".opencode/tools/") && hasExtension(p, ".js", ".jsx", ".ts", ".tsx")
+	})
 	add("gemini.commands", "gemini in:path path:.gemini/commands", func(p string) bool {
 		return strings.HasPrefix(p, ".gemini/commands/") && hasExtension(p, ".toml")
 	})

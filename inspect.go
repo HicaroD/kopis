@@ -3,6 +3,7 @@ package kopis
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"net"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -53,6 +54,20 @@ var (
 
 // Inspect examines only an already catalogued candidate.
 func Inspect(candidate Candidate) []Finding {
+	if isMarkdownPath(candidate.Path) {
+		return nil
+	}
+	if hasExtension(strings.ToLower(candidate.Path), ".js", ".jsx", ".ts", ".tsx") {
+		candidate.Content = maskJSComments(candidate.Content)
+	}
+	switch candidate.CatalogRule {
+	case "opencode.workflow", "codex.workflow":
+		return uniqueFindings(inspectWorkflow(candidate))
+	case "codex.config", "gemini.commands":
+		return uniqueFindings(inspectTOML(candidate))
+	case "gemini.extension-env":
+		return uniqueFindings(inspectDotenv(candidate))
+	}
 	var findings []Finding
 	content := candidate.Content
 	jsonFindings, structured := inspectJSONCredentials(candidate)
@@ -76,40 +91,44 @@ func Inspect(candidate Candidate) []Finding {
 			findings = append(findings, finding(candidate, indicator, classification, severity, value, valueStart, confirmedCredentialGuidance))
 		}
 	}
-	for _, match := range escapedAssignment.FindAllStringSubmatchIndex(content, -1) {
-		value := content[match[4]:match[5]]
-		keyName := content[match[2]:match[3]]
-		if !credentialAssignmentKey(keyName) || excluded(value) || !literal(value) {
-			continue
-		}
-		key := strings.ToLower(keyName)
-		severity := SeverityHigh
-		if directAuthenticationKey(key) {
-			severity = SeverityCritical
-		}
-		findings = append(findings, finding(candidate, indicatorForKey(key), ClassificationConfirmed, severity, value, match[4], confirmedCredentialGuidance))
-	}
-	for _, match := range databaseURL.FindAllStringSubmatchIndex(content, -1) {
-		value := content[match[2]:match[3]]
-		if excluded(value) || !literal(value) {
-			continue
-		}
-		findings = append(findings, finding(candidate, "password", ClassificationConfirmed, SeverityHigh, value, match[2], confirmedCredentialGuidance))
-	}
-	for _, expression := range []*regexp.Regexp{privateKey, quotedSecret, secretURL} {
-		for _, match := range expression.FindAllStringIndex(content, -1) {
-			value := content[match[0]:match[1]]
-			if excluded(value) {
+	if !structured {
+		for _, match := range escapedAssignment.FindAllStringSubmatchIndex(content, -1) {
+			value := content[match[4]:match[5]]
+			keyName := content[match[2]:match[3]]
+			if !credentialAssignmentKey(keyName) || excluded(value) || !literal(value) {
 				continue
 			}
-			indicator, severity := "private_key", SeverityCritical
-			if expression != privateKey {
-				indicator, severity = "authorization_value", expressionSeverity(content, match[0], expression)
+			key := strings.ToLower(keyName)
+			severity := SeverityHigh
+			if directAuthenticationKey(key) {
+				severity = SeverityCritical
 			}
-			findings = append(findings, finding(candidate, indicator, ClassificationConfirmed, severity, value, match[0], confirmedCredentialGuidance))
+			findings = append(findings, finding(candidate, indicatorForKey(key), ClassificationConfirmed, severity, value, match[4], confirmedCredentialGuidance))
+		}
+		for _, match := range databaseURL.FindAllStringSubmatchIndex(content, -1) {
+			value := content[match[2]:match[3]]
+			if excluded(value) || !literal(value) || localCredentialURL(content[match[0]:match[1]]) {
+				continue
+			}
+			findings = append(findings, finding(candidate, "password", ClassificationConfirmed, SeverityHigh, value, match[2], confirmedCredentialGuidance))
 		}
 	}
-	if isExecutableRule(candidate.CatalogRule) {
+	if !structured {
+		for _, expression := range []*regexp.Regexp{privateKey, quotedSecret, secretURL} {
+			for _, match := range expression.FindAllStringIndex(content, -1) {
+				value := content[match[0]:match[1]]
+				if excluded(value) || expression == secretURL && localCredentialURL(value) {
+					continue
+				}
+				indicator, severity := "private_key", SeverityCritical
+				if expression != privateKey {
+					indicator, severity = "authorization_value", expressionSeverity(content, match[0], expression)
+				}
+				findings = append(findings, finding(candidate, indicator, ClassificationConfirmed, severity, value, match[0], confirmedCredentialGuidance))
+			}
+		}
+	}
+	if !structured && isExecutableRule(candidate.CatalogRule, candidate.Path) {
 		for _, item := range []struct {
 			re                *regexp.Regexp
 			indicator, reason string
@@ -120,6 +139,93 @@ func Inspect(candidate Candidate) []Finding {
 		}
 	}
 	return uniqueFindings(findings)
+}
+
+func maskJSComments(source string) string {
+	result := []byte(source)
+	quote, escaped, lineComment, blockComment := byte(0), false, false, false
+	for i := 0; i < len(result); i++ {
+		if lineComment || blockComment {
+			if lineComment && source[i] == '\n' {
+				lineComment = false
+				continue
+			}
+			if blockComment && i+1 < len(source) && source[i] == '*' && source[i+1] == '/' {
+				result[i], result[i+1] = ' ', ' '
+				i++
+				blockComment = false
+				continue
+			}
+			if source[i] != '\n' {
+				result[i] = ' '
+			}
+			continue
+		}
+		if quote != 0 {
+			if escaped {
+				escaped = false
+			} else if source[i] == '\\' {
+				escaped = true
+			} else if source[i] == quote {
+				quote = 0
+			}
+			continue
+		}
+		if source[i] == '\'' || source[i] == '"' || source[i] == '`' {
+			quote = source[i]
+		} else if source[i] == '/' && i+1 < len(source) && source[i+1] == '/' {
+			lineComment = true
+			result[i] = ' '
+		} else if source[i] == '/' && i+1 < len(source) && source[i+1] == '*' {
+			blockComment = true
+			result[i] = ' '
+		}
+	}
+	return string(result)
+}
+
+func inspectEmbeddedCommand(candidate Candidate, source string, offset int) []Finding {
+	var findings []Finding
+	for _, match := range escapedAssignment.FindAllStringSubmatchIndex(source, -1) {
+		value := source[match[4]:match[5]]
+		key := source[match[2]:match[3]]
+		if credentialAssignmentKey(key) && literal(value) && !excluded(value) {
+			severity := SeverityHigh
+			if directAuthenticationKey(strings.ToLower(key)) {
+				severity = SeverityCritical
+			}
+			findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationConfirmed, severity, value, offset+match[4], confirmedCredentialGuidance))
+		}
+	}
+	for _, match := range assignment.FindAllStringSubmatchIndex(source, -1) {
+		valueStart, valueEnd := assignmentValue(match)
+		value := source[valueStart:valueEnd]
+		value, valueStart = literalAssignmentValue(value, valueStart)
+		key := source[match[2]:match[3]]
+		if credentialAssignmentKey(key) && literal(value) && !excluded(value) {
+			findings = append(findings, finding(candidate, indicatorForKey(strings.ToLower(key)), ClassificationConfirmed, SeverityHigh, value, offset+valueStart, confirmedCredentialGuidance))
+		}
+	}
+	for _, match := range databaseURL.FindAllStringSubmatchIndex(source, -1) {
+		value := source[match[2]:match[3]]
+		if literal(value) && !excluded(value) && !localCredentialURL(source[match[0]:match[1]]) {
+			findings = append(findings, finding(candidate, "password", ClassificationConfirmed, SeverityHigh, value, offset+match[2], confirmedCredentialGuidance))
+		}
+	}
+	return findings
+}
+
+func localCredentialURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func expressionSeverity(content string, start int, expression *regexp.Regexp) string {
@@ -166,8 +272,9 @@ func findingAt(c Candidate, indicator, classification, severity, value string, s
 	return Finding{Provider: c.Provider, Repository: c.Repository, RepositoryURL: safeURL(c.RepositoryURL), Revision: c.Revision, Path: c.Path, Tool: c.Tool, CatalogRule: c.CatalogRule, Indicator: indicator, Classification: classification, Severity: severity, Fingerprint: fingerprintValue, Location: location(c.Content, start, end), Guidance: guidance, Reason: reasonFor(classification)}
 }
 
-func isExecutableRule(rule string) bool {
-	return strings.Contains(rule, "plugin") || strings.Contains(rule, "tool") || strings.Contains(rule, "workflow") || strings.Contains(rule, "hooks") || strings.Contains(rule, "skills") || strings.Contains(rule, "rules") || strings.Contains(rule, "commands") || strings.Contains(rule, "assets")
+func isExecutableRule(rule, filename string) bool {
+	return hasExtension(strings.ToLower(filename), ".js", ".jsx", ".ts", ".tsx", ".sh", ".py") &&
+		(strings.Contains(rule, "plugin") || strings.Contains(rule, "tool") || strings.Contains(rule, "hooks") || strings.Contains(rule, "assets") || strings.Contains(rule, "skills") || strings.Contains(rule, "rules"))
 }
 func indicatorForKey(key string) string {
 	switch {
@@ -188,7 +295,7 @@ func fingerprint(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 func literal(value string) bool {
-	return len(value) >= 8 && !strings.HasPrefix(value, "$") && !strings.HasPrefix(value, "%") && !strings.Contains(value, "{{") && !strings.Contains(value, "${{")
+	return len(value) >= 8 && !strings.HasPrefix(value, "$") && !strings.HasPrefix(value, "%") && !strings.Contains(value, "{{") && !strings.Contains(value, "${") && !opencodeEnvRef.MatchString(value)
 }
 
 func assignmentValue(match []int) (int, int) {
@@ -216,20 +323,36 @@ func directAuthenticationKey(key string) bool {
 	return strings.Contains(key, "api") || strings.Contains(key, "authorization") || strings.Contains(key, "auth") || strings.Contains(key, "token") || strings.Contains(key, "clientsecret") || strings.Contains(key, "client_secret")
 }
 func credentialAssignmentKey(key string) bool {
-	lower := strings.ToLower(key)
-	if strings.Contains(lower, "api_key") || strings.Contains(lower, "api-key") || strings.Contains(lower, "apikey") || strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "authorization") || strings.Contains(lower, "auth") {
-		return true
+	key = strings.ReplaceAll(key, "-", "_")
+	key = strings.ReplaceAll(key, ".", "_")
+	var words []string
+	start := 0
+	for i := 0; i < len(key); i++ {
+		if key[i] == '_' {
+			if i > start {
+				words = append(words, strings.ToLower(key[start:i]))
+			}
+			start = i + 1
+		} else if i > start && key[i] >= 'A' && key[i] <= 'Z' && key[i-1] >= 'a' && key[i-1] <= 'z' {
+			words = append(words, strings.ToLower(key[start:i]))
+			start = i
+		}
 	}
-	for start := 0; start < len(lower); {
-		i := strings.Index(lower[start:], "token")
-		if i < 0 {
-			return false
-		}
-		end := start + i + len("token")
-		if end == len(key) || strings.ContainsRune("_.-", rune(key[end])) || key[end] >= 'A' && key[end] <= 'Z' {
+	if start < len(key) {
+		words = append(words, strings.ToLower(key[start:]))
+	}
+	for i, word := range words {
+		switch word {
+		case "password", "passwd", "token", "secret", "auth", "authorization", "apikey", "clientsecret":
 			return true
+		case "api":
+			if i+1 < len(words) && words[i+1] == "key" {
+				return true
+			}
 		}
-		start = end
+		if strings.HasSuffix(word, "password") && len(word) > len("password") {
+			return true // e.g. PGPASSWORD
+		}
 	}
 	return false
 }
