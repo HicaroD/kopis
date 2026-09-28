@@ -48,6 +48,7 @@ var (
 	processArg        = regexp.MustCompile(`(?i)(?:curl|wget|httpie|gh|git|npm|docker)\b[^\n]*(?:--(?:token|password|header|auth)|(?:token|password|authorization)=)`)
 	transfer          = regexp.MustCompile(`(?i)(?:curl|wget|scp|rsync|nc|netcat)\b[^\n]*(?:https?://|--data|--upload-file|-T\s)`)
 	directAuth        = regexp.MustCompile(`(?i)(?:api[_-]?key|token|secret|password|authorization|auth|client[_-]?secret)\s*[=:]\s*["']?$`)
+	opencodeEnvRef    = regexp.MustCompile(`\{env:[A-Za-z_][A-Za-z0-9_]*\}`)
 )
 
 // Inspect examines only an already catalogued candidate.
@@ -234,7 +235,7 @@ func credentialAssignmentKey(key string) bool {
 }
 func excluded(value string) bool {
 	lower := strings.ToLower(value)
-	return strings.HasPrefix(value, "process.env.") || strings.HasPrefix(value, "import.meta.env.") ||
+	return opencodeEnvRef.MatchString(value) || strings.HasPrefix(value, "process.env.") || strings.HasPrefix(value, "import.meta.env.") ||
 		lower == "example" || lower == "placeholder" || lower == "redacted" || lower == "xxxxx" || lower == "<token>" ||
 		strings.HasPrefix(lower, "your_") || strings.HasPrefix(lower, "your-")
 }

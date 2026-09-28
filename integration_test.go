@@ -171,6 +171,14 @@ func TestInspectionDoesNotSilentlyIgnoreLiteralContainingExample(t *testing.T) {
 	}
 }
 
+func TestInspectionOpenCodeEnvReferencesAreNotLiteralCredentials(t *testing.T) {
+	content := `{"mcp":{"remote":{"headers":{"x-personal-token":"{env:PERSONAL_TOKEN}","Authorization":"Bearer {env:REMOTE_API_KEY}"}},"other":{"headers":{"Authorization":"Bearer synthetic-literal-token-123"}}}}`
+	findings := Inspect(Candidate{Path: "opencode.json", CatalogRule: "opencode.config", Content: content})
+	if len(findings) != 1 || findings[0].Fingerprint != fingerprint("Bearer synthetic-literal-token-123") {
+		t.Fatalf("OpenCode environment references were treated as exposed literals, or a literal was lost: %+v", findings)
+	}
+}
+
 func TestInspectionQuotedDefaultUsesLiteralLocationAndFingerprint(t *testing.T) {
 	content := `api_key="${TOKEN:-literal-secret}" api_key=${TOKEN:-literal-secret}`
 	findings := Inspect(Candidate{Path: "opencode.json", CatalogRule: "opencode.config", Content: content})
